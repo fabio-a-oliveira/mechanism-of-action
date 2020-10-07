@@ -9,6 +9,10 @@ if (!require("tidyverse")) install.packages("tidyverse") else library("tidyverse
 if (!require("caret")) install.packages("caret") else library("caret")
 if (!require("data.table")) install.packages("data.table") else library("data.table")
 
+if (!("parallel" %in% installed.packages())) {install.packages("parallel")}
+if (!("doParallel" %in% installed.packages())) {install.packages("doParallel")}
+if (!("beepr" %in% installed.packages())) {install.packages("beepr")}
+
 options("datatable.print.topn" = 20)
 
 # Load data --------------------------------------------------------------------
@@ -59,6 +63,11 @@ grid <- expand.grid(predFixed = c(40,60,80,120,160,240,480,600,872),
 
 numPrincipalComponents <- 872
 
+# create and register processor cluster
+clust <- parallel::makePSOCKcluster(8)
+doParallel::registerDoParallel(clust)
+
+# train model
 fit_Rborist_872 <-
   train(method = "Rborist",
         x = cbind(select(train$features, cp_type, cp_dose, cp_time),
@@ -66,12 +75,16 @@ fit_Rborist_872 <-
         y = train$pca.outcomes$x[,1],
         tuneGrid = grid,
         trControl = trainControl(method = "LGOCV", p = .9, number = 1,
-                                 verboseIter = TRUE))
+                                 verboseIter = TRUE, allowParallel = TRUE))
 
-predictions <- 
-  predict(fit_Rborist_all,
+# stop cluster
+parallel::stopCluster(clust)
+doParallel::stopImplicitCluster()
+
+predictions <-                                                                                                          # OVERTRAINING! PREDICTIONS CALCULATED ON TRAINING SET!
+  predict(fit_Rborist_872,
           cbind(select(train$features, cp_type, cp_dose, cp_time),
-                train$pca.features$x[,1:100])) %>% 
+                train$pca.features$x[,1:numPrincipalComponents])) %>% 
   matrix(nrow = 1) %>% 
   t() %*% 
   t(train$pca.outcomes$rotation[,1])
@@ -90,3 +103,6 @@ score
 confusionMatrix(data = predictions %>% round(0) %>% as.factor(),
                 reference = y %>% as.factor(),
                 positive = "1")
+
+# beep!
+beepr::beep(5)
