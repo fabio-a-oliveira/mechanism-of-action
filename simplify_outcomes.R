@@ -43,8 +43,10 @@ pc <-
   select(-sig_id) %>% 
   prcomp()
 
+# Create outcomes approximation with N PCs -------------------------------------
+
 N <- 206
-N <- 200
+N <- 8
 
 approximation <-  pc$x[,1:N] %*% t(pc$rotation[,1:N])
 
@@ -55,7 +57,7 @@ approximation %>% as.vector %>% cut(breaks = seq(0,1,.1)) %>% table()
 
 # Performance function ---------------------------------------------------------
 
-p <- pmax(pmin(round(approximation,0),1−10^−15),10^−15)
+p <- pmax(pmin(approximation,1−10^−15),10^−15)
 y <- train$targets %>% select(-sig_id) %>% as.matrix()
 
 score <- - sum(y * log(p) + (1-y) * log(1 - p)) / (206 * 23814)

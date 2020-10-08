@@ -150,6 +150,36 @@ train$targets %>%
   rowSums() %>% 
   table()
 
+# how many different outcomes?
+outcome_combinations <-
+  train$targets %>% 
+  pivot_longer(cols = -"sig_id",
+               names_to = "mechanism",
+               values_to = "target") %>% 
+  filter(target == 1) %>% 
+  select(-target) %>% 
+  arrange(sig_id,mechanism) %>%
+  group_by(sig_id) %>% 
+  mutate(number = row_number(),
+         mechanisms = n()) %>% 
+  pivot_wider(names_from = "number",
+              values_from = "mechanism") %>% 
+  unite(-"sig_id",-"mechanisms", col = "output", na.rm = TRUE, sep = " | ") %>% 
+  group_by(output, mechanisms) %>% 
+  summarise(count = n(), .groups = 'drop') %>% 
+  arrange(desc(count))
+
+outcome_combinations
+
+# how many combinations have more than 1 mechanism?
+outcome_combinations %>% 
+  filter(mechanisms > 1) %>% 
+  pull(output) %>% 
+  unique() %>% 
+  length()
+
+rm(outcome_combinations)
+
 # are mechanisms correlated?
 train$targets %>% 
   column_to_rownames(var = "sig_id") %>% 
@@ -413,3 +443,114 @@ score
 confusionMatrix(data = predictions %>% round(0) %>% as.factor(),
                 reference = y %>% as.factor(),
                 positive = "1")
+
+# Examine results from model 003 ---------------------------------------------------------------------------------------
+
+# evaluate results on held out samples
+
+# targets
+y <- train$targets[train$heldOut,] %>% select(-sig_id) %>% as.matrix()
+
+# PCA approximation
+y_app <- 
+  train$pca.outcomes$x[train$heldOut,1, drop = FALSE] %*% t(train$pca.outcomes$rotation[,1])
+
+# predictions
+y_hat <- 
+  predict(fit003_200,
+          train$features[train$heldOut,] %>% select(-sig_id)) %>% 
+  matrix(nrow = 1) %>% 
+  t() %*% 
+  t(train$pca.outcomes$rotation[,1])
+
+# scores
+
+limitRange <- function(x,delta){pmin(pmax(x,delta),1-delta)}
+
+score <- 
+  function(reference,prediction){
+    N <- nrow(reference)
+    M <- ncol(reference)
+    score <- - sum(reference*log(prediction) + (1-reference)*log(1-prediction)) / (N*M)
+}
+
+delta <- 10^(-15)
+
+score_target_app <-
+  score(reference = y,
+        prediction = limitRange(y_app,delta))
+
+score_app_prediction <-
+  score(reference = limitRange(y_app,delta),
+        prediction = limitRange(y_hat,delta))
+
+score_target_prediction <-
+  score(reference = y,
+        prediction = limitRange(y_hat,delta))
+
+score_target_app
+score_app_prediction
+score_target_prediction
+
+cm_target_app <- confusionMatrix(reference = y %>% as.factor(),
+                                 data = y_app %>% limitRange(0) %>% round(0) %>% as.factor(),
+                                 positive = "1")
+
+cm_app_prediction <- confusionMatrix(reference = y_app %>% limitRange(0) %>% round(0) %>% as.factor(),
+                                     data = y_hat %>% limitRange(0) %>% round(0) %>% as.factor(),
+                                     positive = "1")
+
+cm_target_prediction <- confusionMatrix(reference = y %>% as.factor(),
+                                        data = y_app %>% limitRange(0) %>% round(0) %>% as.factor(),
+                                        positive = "1")
+cm_target_app
+cm_app_prediction
+cm_target_prediction
+
+# Experiment with options in the caret package -------------------------------------------------------------------------
+
+N = 500
+
+x <- matrix(runif(N * 3,min=0,max=1),
+            ncol=3)
+
+colnames(x) <- c("x1","x2","x3")
+
+epsilon <- matrix(rnorm(N,0,.1),ncol=1) 
+
+y <- 
+  x[,1,drop=FALSE] + 
+  2 * x[,2,drop=FALSE] + 
+  x[,3,drop=FALSE]^2 + 
+  epsilon
+
+colnames(y) <- "outcome"
+
+fit <- train(x = x,
+             y = y[,1],
+             method = "Rborist",
+             ntree = 50,
+             tuneGrid = data.frame(predFixed = 1, minNode = 2),
+             trControl = trainControl(method = 'none',
+                                      returnData = FALSE,
+                                      returnResamp = 'none',
+                                      savePredictions = FALSE,
+                                      classProbs = FALSE,
+                                      trim = TRUE,
+                                      allowParallel = TRUE))
+
+fit
+object.size(fit) / 2^20
+object.size(fit$finalModel) / 2^20
+
+
+
+
+
+
+
+
+
+
+
+
