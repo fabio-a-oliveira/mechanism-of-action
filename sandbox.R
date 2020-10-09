@@ -2,6 +2,8 @@
 
 if (!require("tidyverse")) install.packages("tidyverse") else library("tidyverse")
 if (!require("caret")) install.packages("caret") else library("caret")
+if (!require("rpart")) install.packages("rpart") else library("rpart")
+# if (!require("MASS")) install.packages("MASS") else library("MASS")
 if (!require("data.table")) install.packages("data.table") else library("data.table")
 
 options("datatable.print.topn" = 20)
@@ -66,7 +68,8 @@ identical(train$features$sig_id, train$targets$sig_id) %>% mean()
 # combinations of the categorical variables
 train$features %>% 
   group_by(cp_time, cp_type, cp_dose) %>% 
-  summarise(count = n(), .groups = 'drop')
+  summarise(count = n(), .groups = 'drop') %>% 
+  arrange(desc(count))
 
 # NAs in the feature space?
 train$features %>% 
@@ -543,14 +546,192 @@ fit
 object.size(fit) / 2^20
 object.size(fit$finalModel) / 2^20
 
+# Naive predictions ----------------------------------------------------------------------------------------------------
+
+# predict global mean
+prediction <- train$targets %>% select(-sig_id) %>%  as.matrix() %>% mean()
+target <- train$targets %>% select(-sig_id) %>% as.matrix()
+score(reference = target, prediction = prediction)
+
+# predict mean for each mechanism
+prediction <-
+  target %>% 
+  colMeans() %>% 
+  matrix(nrow = nrow(target), ncol = ncol(target), byrow = TRUE)
+colnames(prediction) <- colnames(target)
+score(reference = target, prediction = prediction)
+
+# how good can the score get with perfect predictions for one mechanism and the mean for the others?
+prediction[,"nfkb_inhibitor"] <- target[,"nfkb_inhibitor"]
+score(reference = target, prediction = prediction)
 
 
+# Examine most popular mechanism in details ----------------------------------------------------------------------------
 
+numMechanisms <- 1
+common_mechanisms <-
+  train$targets %>% 
+  pivot_longer(cols = - "sig_id",
+               names_to = "mechanism",
+               values_to = "value") %>% 
+  filter(value == 1) %>% 
+  select(-value) %>% 
+  group_by(mechanism) %>% 
+  summarise(count = n(), .groups = 'drop') %>% 
+  arrange(desc(count)) %>% 
+  top_n(n = numMechanisms, wt = count) %>% 
+  pull(mechanism)
 
+x <- train$features
+y <- train$targets[,'nfkb_inhibitor']
 
+df <-
+  data.frame(target = y,
+             prediction = mean(y))
+  
+df %>% 
+  summarise(score = score(reference = target %>% as.data.frame(), 
+                          prediction = prediction %>% as.data.frame()))
 
+# data frame in long format
+df <-
+  train$targets %>% 
+  select(sig_id, nfkb_inhibitor) %>% 
+  mutate(nfkb_inhibitor = as.factor(nfkb_inhibitor)) %>% 
+  left_join(train$features, by = "sig_id") %>% 
+  pivot_longer(cols = -c(sig_id,nfkb_inhibitor), names_to = "feature", values_to = "activation")
 
+# mean activation for each of the features, grouped by output
+df %>% 
+  group_by(nfkb_inhibitor, feature) %>% 
+  summarise(mean_activation = mean(activation)) %>% 
+  ggplot(aes(x = feature, y = mean_activation, color = nfkb_inhibitor)) +
+  geom_point()
 
+# 
 
+df %>% 
+  filter(feature %in% c("g.0","g.1")) %>% 
+  pivot_wider(names_from = "feature", values_from = "activation") %>% 
+  ggplot(aes(x = g.0, y = g.1, color = nfkb_inhibitor)) +
+  geom_point()
 
+# Fit different models and compare results -----------------------------------------------------------------------------
 
+# classification tree
+
+fitTree <-
+  train(method = "rpart",
+        x = train$features[-train$heldOut,] %>% select(-sig_id),
+        y = train$targets$nfkb_inhibitor[-train$heldOut] %>% as.factor(),
+        trControl = trainControl(method = 'LGOCV', p = .9, number = 1,
+                                 verboseIter = TRUE))
+
+# random forest
+
+fitForest <-
+  train(method = "Rborist",
+        x = train$features[-train$heldOut,] %>% select(-sig_id),
+        y = train$targets$nfkb_inhibitor[-train$heldOut] %>% as.factor(),
+        verbose = TRUE,
+        tuneGrid = data.frame(predFixed = 50, minNode = 2),
+        trControl = trainControl(method = 'LGOCV', p = .9, number = 1,
+                                 verboseIter = TRUE))
+  
+# LDA
+
+fitLDA <-
+  train(method = "lda",
+        x = train$features[-train$heldOut,] %>% select(-sig_id),
+        y = train$targets$nfkb_inhibitor[-train$heldOut] %>% as.factor(),
+        trControl = trainControl(method = 'LGOCV', p = .9, number = 1,
+                                 verboseIter = TRUE))
+# generalized linear model
+
+fitGLM <-
+  train(method = "glm",
+        x = train$features[-train$heldOut,] %>% select(-sig_id),
+        y = train$targets$nfkb_inhibitor[-train$heldOut] %>% as.factor(),
+        trControl = trainControl(method = 'LGOCV', p = .9, number = 1,
+                                 verboseIter = TRUE))
+
+# KNN
+
+fitKNN <-
+  train(method = "knn",
+        x = train$pca.features$x[-train$heldOut,1:3],
+        y = train$targets$nfkb_inhibitor[-train$heldOut] %>% as.factor(),
+        tuneGrid = data.frame(k = c(3,5,7,10)),
+        trControl = trainControl(method = 'LGOCV', p = .9, number = 1,
+                                 verboseIter = TRUE))
+
+# confusion matrices
+
+confusionMatrix(fitTree, positive = "1")
+confusionMatrix(fitForest, positive = "1")
+confusionMatrix(fitLDA, positive = "1")
+confusionMatrix(fitGLM, positive = "1")
+confusionMatrix(fitKNN, positive = "1")
+
+# examine models
+
+predictions <- 
+  data.frame(groundTruth = train$targets$nfkb_inhibitor[train$heldOut] %>% as.factor,
+             predictionTree = predict(fitTree, train$features[train$heldOut,] %>% select(-sig_id)),
+             predictionForest = predict(fitForest, train$features[train$heldOut,] %>% select(-sig_id)),
+             predictionLDA = predict(fitLDA, train$features[train$heldOut,] %>% select(-sig_id)),
+             predictionGLM = predict(fitGLM, train$features[train$heldOut,] %>% select(-sig_id)),
+             predictionKNN = predict(fitKNN, train$pca.features$x[train$heldOut,1:3]))
+
+predictions %>% 
+  filter(groundTruth == 1)
+
+predictions %>% 
+  filter(groundTruth != predictionForest)
+
+predictions %>% 
+  mutate(groundTruth = groundTruth %>% as.character %>% as.integer(),
+         predictionTree = predictionTree %>% as.character %>% as.integer(),
+         predictionForest = predictionForest %>% as.character %>% as.integer(),
+         predictionLDA = predictionLDA %>% as.character %>% as.integer(),
+         predictionGLM = predictionGLM %>% as.character %>% as.integer(),
+         predictionKNN = predictionKNN %>% as.character %>% as.integer()) %>% 
+  mutate(mean = (predictionTree+predictionForest+predictionLDA+predictionGLM+predictionKNN)/5) %>% 
+  summarise(RMSE_tree = RMSE(groundTruth,predictionTree),
+            RMSE_forest = RMSE(groundTruth,predictionForest),
+            RMSE_LDA = RMSE(groundTruth,predictionLDA),
+            RMSE_GLM = RMSE(groundTruth,predictionGLM),
+            RMSE_KNN = RMSE(groundTruth,predictionKNN),
+            RMSE_mean = RMSE(groundTruth,mean))
+  
+
+# Correlation between predictors and outcome ---------------------------------------------------------------------------
+
+x <- train$features[-train$heldOut,] %>% select(-sig_id) %>% as.matrix()
+pc <- train$pca.features$x[-train$heldOut,] %>% as.matrix()
+y <- train$targets$nfkb_inhibitor[-train$heldOut] %>% as.matrix()
+
+features_correlations <-
+  data.frame(feature = colnames(x),
+             correlation = cor(x,y)) %>% 
+  arrange(desc(correlation))
+
+pc.correlations <-
+  data.frame(PC = colnames(pc),
+             correlation = cor(pc, y)) %>% 
+  arrange(desc(abs(correlation)))
+
+highest.correlations <-
+  pc.correlations %>% 
+  head(3) %>% 
+  .$PC
+
+fit_KNN_high_cor <- train(method = "knn",
+                          x = train$pca.features$x[-train$heldOut,highest.correlations],
+                          y = train$targets$nfkb_inhibitor[-train$heldOut] %>% as.factor(),
+                          preProcess = preProcess(method = c("center","scale")),
+                          tuneGrid = data.frame(k = c(3,5,7,10)),
+                          trControl = trainControl(method = 'LGOCV', p = .9, number = 1,
+                                                   verboseIter = TRUE))
+
+confusionMatrix(fit_KNN_high_cor, positive = "1")

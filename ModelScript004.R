@@ -67,7 +67,8 @@ train$pca.outcomes <-
 
 # Partition data - create hold-out samples -----------------------------------------------------------------------------
 
-proportionHeldOut <- .1
+proportionHeldOut <- .1 # for actual training
+# proportionHeldOut <- .98 # for quick experiments
 
 train$heldOut <- createDataPartition(train$pca.outcomes$x[,1], # considering 1st PC as output
                              p = proportionHeldOut, times = 1, list = FALSE)
@@ -220,10 +221,127 @@ score_target_prediction
 # beep!
 beepr::beep(5)
 
-# Save models ------------------------------------------------------------------
+# Save models ----------------------------------------------------------------------------------------------------------
 
 save(list = paste("fit004",1:numPrincipalComponents %>% as.character() %>% str_pad(width=3,pad="0"), sep = "_"),
      file = "ModelFit004.Rdata")
 
 
+# Analysis -------------------------------------------------------------------------------------------------------------
 
+# confusion matrices
+
+cm_target_app <- confusionMatrix(data = y_app %>% limitRange %>% round(0) %>% as.factor,
+                                 reference = y %>% as.factor,
+                                 positive = "1")
+
+cm_app_prediction <- confusionMatrix(data = y_hat %>% limitRange %>% round(0) %>% as.factor,
+                                     reference = y_app %>% limitRange %>% round(0) %>% as.factor,
+                                     positive = "1")
+
+cm_target_prediction <- confusionMatrix(data = y_hat %>% limitRange %>% round(0) %>% as.factor,
+                                        reference = y %>% as.factor,
+                                        positive = "1")
+
+
+cm_target_app
+cm_app_prediction
+cm_target_prediction
+
+# how does each model fit its target (vector of principal components) on the held out samples
+
+data.frame(reference = train$pca.outcomes$x[train$heldOut,1],
+           prediction = predict(fit004_001, train$features[train$heldOut,] %>% 
+                                  select(-sig_id)) %>% matrix(ncol = 1)) %>% 
+  summarise(RMSE001 = RMSE(reference,prediction))
+
+data.frame(reference = train$pca.outcomes$x[train$heldOut,2],
+           prediction = predict(fit004_002, train$features[train$heldOut,] %>% 
+                                  select(-sig_id)) %>% matrix(ncol = 1)) %>% 
+  summarise(RMSE002 = RMSE(reference,prediction))
+
+data.frame(reference = train$pca.outcomes$x[train$heldOut,3],
+           prediction = predict(fit004_003, train$features[train$heldOut,] %>% 
+                                  select(-sig_id)) %>% matrix(ncol = 1)) %>% 
+  summarise(RMSE003 = RMSE(reference,prediction))
+
+data.frame(reference = train$pca.outcomes$x[train$heldOut,4],
+           prediction = predict(fit004_004, train$features[train$heldOut,] %>% 
+                                  select(-sig_id)) %>% matrix(ncol = 1)) %>% 
+  summarise(RMSE004 = RMSE(reference,prediction))
+
+data.frame(reference = train$pca.outcomes$x[train$heldOut,5],
+           prediction = predict(fit004_005, train$features[train$heldOut,] %>% 
+                                  select(-sig_id)) %>% matrix(ncol = 1)) %>% 
+  summarise(RMSE005 = RMSE(reference,prediction))
+
+data.frame(reference = train$pca.outcomes$x[train$heldOut,6],
+           prediction = predict(fit004_006, train$features[train$heldOut,] %>% 
+                                  select(-sig_id)) %>% matrix(ncol = 1)) %>% 
+  summarise(RMSE006 = RMSE(reference,prediction))
+
+data.frame(reference = train$pca.outcomes$x[train$heldOut,7],
+           prediction = predict(fit004_007, train$features[train$heldOut,] %>% 
+                                  select(-sig_id)) %>% matrix(ncol = 1)) %>% 
+  summarise(RMSE007 = RMSE(reference,prediction))
+
+data.frame(reference = train$pca.outcomes$x[train$heldOut,8],
+           prediction = predict(fit004_008, train$features[train$heldOut,] %>% 
+                                  select(-sig_id)) %>% matrix(ncol = 1)) %>% 
+  summarise(RMSE008 = RMSE(reference,prediction))
+
+data.frame(reference = train$pca.outcomes$x[train$heldOut,9],
+           prediction = predict(fit004_009, train$features[train$heldOut,] %>% 
+                                  select(-sig_id)) %>% matrix(ncol = 1)) %>% 
+  summarise(RMSE009 = RMSE(reference,prediction))
+
+data.frame(reference = train$pca.outcomes$x[train$heldOut,10],
+           prediction = predict(fit004_010, train$features[train$heldOut,] %>% 
+                                  select(-sig_id)) %>% matrix(ncol = 1)) %>% 
+  summarise(RMSE010 = RMSE(reference,prediction))
+
+# is the prediction improving as we add more PCs?
+
+sapply(1:numPrincipalComponents, function(PCs){
+
+  Y <- train$targets[train$heldOut,] %>% select(-sig_id) %>% as.matrix()
+    
+  Y_app <- 
+    train$pca.outcomes$x[train$heldOut,1:PCs] %*% 
+    t(train$pca.outcomes$rotation[,1:PCs])
+  
+  Y_hat <- 
+    y_hat %*% train$pca.outcomes$rotation[,1:PCs] %*% t(train$pca.outcomes$rotation[,1:PCs])
+  
+  RMSE <- RMSE(Y,Y_hat)
+})
+
+# histogram of PCs on target vectors
+train$pca.outcomes$x[-train$heldOut,1] %>% histogram
+train$pca.outcomes$x[-train$heldOut,2] %>% histogram
+train$pca.outcomes$x[-train$heldOut,3] %>% histogram
+train$pca.outcomes$x[-train$heldOut,4] %>% histogram
+train$pca.outcomes$x[-train$heldOut,5] %>% histogram
+train$pca.outcomes$x[-train$heldOut,6] %>% histogram
+train$pca.outcomes$x[-train$heldOut,7] %>% histogram
+train$pca.outcomes$x[-train$heldOut,8] %>% histogram
+train$pca.outcomes$x[-train$heldOut,9] %>% histogram
+train$pca.outcomes$x[-train$heldOut,10] %>% histogram
+
+# variable importance for each model
+fit004_001 %>% varImp
+fit004_002 %>% varImp
+fit004_003 %>% varImp
+fit004_004 %>% varImp
+fit004_005 %>% varImp
+fit004_006 %>% varImp
+fit004_007 %>% varImp
+fit004_008 %>% varImp
+fit004_009 %>% varImp
+fit004_010 %>% varImp
+
+# principal components rotation matrix
+train$pca.outcomes$rotation[,1, drop = FALSE] %>% 
+  as.data.frame() %>% 
+  rownames_to_column("mechanism") %>% 
+  arrange(PC1)
