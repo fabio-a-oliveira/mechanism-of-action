@@ -1,4 +1,4 @@
-# Housekeeping -----------------------------------------------------------------
+# Housekeeping ---------------------------------------------------------------------------------------------------------
 
 if (!require("tidyverse")) install.packages("tidyverse") else library("tidyverse")
 if (!require("caret")) install.packages("caret") else library("caret")
@@ -8,7 +8,20 @@ if (!require("data.table")) install.packages("data.table") else library("data.ta
 
 options("datatable.print.topn" = 20)
 
-# Load data --------------------------------------------------------------------
+# Declaration of some useful functions ---------------------------------------------------------------------------------
+
+limitRange <- function(x){
+  delta <- 10^(-15)
+  pmin(pmax(x,delta),1-delta)}
+
+score <- 
+  function(reference,prediction){
+    N <- nrow(reference)
+    M <- ncol(reference)
+    - sum(reference*log(limitRange(prediction)) + (1-reference)*log(1-limitRange(prediction))) / (N*M)
+  }
+
+# Load data ------------------------------------------------------------------------------------------------------------
 
 train <- 
   list(features = read.csv(file.path("files","train_features.csv")),
@@ -18,7 +31,7 @@ train <-
 test <- 
   list(features = read.csv(file.path("files","test_features.csv")))
 
-# Data wrangling  --------------------------------------------------------------
+# Data wrangling  ------------------------------------------------------------------------------------------------------
 
 train$features <-
   train$features %>% 
@@ -49,7 +62,7 @@ train$pca.outcomes <-
   select(-sig_id) %>% 
   prcomp()
 
-# Basic EDA --------------------------------------------------------------------
+# Basic EDA ------------------------------------------------------------------------------------------------------------
 
 # features and dimensions of the features object
 train$features %>% names
@@ -315,7 +328,7 @@ correlations %>%
 rm(correlations)
 
 
-# Proof of concept - predict most common mechanism -----------------------------
+# Proof of concept - predict most common mechanism ---------------------------------------------------------------------
 
 grid <- expand.grid(predFixed = c(10,50,100,200),
                     minNode = 2)
@@ -344,7 +357,7 @@ data.frame(target = train$targets$nfkb_inhibitor,
            prediction = predict(fit_Rborist, select(train$features, -sig_id))) %>% 
   filter(target != round(prediction,0))
 
-# Predict most common mechanism with PCA ---------------------------------------
+# Predict most common mechanism with PCA -------------------------------------------------------------------------------
 
 grid <- expand.grid(predFixed = c(10,20,30,40,60,80),
                     minNode = 2)
@@ -382,7 +395,7 @@ confusionMatrix(data =
                 reference = train$targets$nfkb_inhibitor %>% as.factor(),
                 positive = "1")
 
-# Experiment with number of PCAs -----------------------------------------------
+# Experiment with number of PCAs ---------------------------------------------------------------------------------------
 
 grid <- expand.grid(predFixed = c(40,60,80,120,140,160),
                     minNode = 2)
@@ -408,7 +421,7 @@ fit_Rborist_PCA_400 <-
                                  number = 1,
                                  verboseIter = TRUE))
 
-# Create model with PCAs applied to features and outcomes ----------------------
+# Create model with PCAs applied to features and outcomes --------------------------------------------------------------
 
 grid <- expand.grid(predFixed = c(40,60,80,120,140,160,200),
                     minNode = 2)
@@ -726,6 +739,8 @@ highest.correlations <-
   head(3) %>% 
   .$PC
 
+# Fit KNN using highest correlation PCs to calculate distances ---------------------------------------------------------
+
 fit_KNN_high_cor <- train(method = "knn",
                           x = train$pca.features$x[-train$heldOut,highest.correlations],
                           y = train$targets$nfkb_inhibitor[-train$heldOut] %>% as.factor(),
@@ -735,3 +750,54 @@ fit_KNN_high_cor <- train(method = "knn",
                                                    verboseIter = TRUE))
 
 confusionMatrix(fit_KNN_high_cor, positive = "1")
+
+
+# Simplify problem by restricting to single most common combination of categorical values ------------------------------
+
+train$features <-
+  train$features %>% 
+  filter(cp_time == "48", cp_type == "trt_cp", cp_dose == "D1") %>%
+  select(- c(cp_time, cp_type, cp_dose))
+
+train$targets <-
+  train$targets %>% 
+  filter(sig_id %in% train$features$sig_id)
+
+# Run Principal Component Analysis on simplified set -------------------------------------------------------------------
+
+train$pca.outcomes <-
+  train$targets %>% 
+  select(-sig_id) %>% 
+  prcomp()
+
+train$pca.features <-
+  train$features %>% 
+  select(-sig_id) %>% 
+  prcomp()
+
+# Partition data - create hold-out samples -----------------------------------------------------------------------------
+
+# proportionHeldOut <- .1 # for actual training
+# proportionHeldOut <- .98 # for quick experiments
+proportionHeldOut <- .5 # for quick lm (can't have deficient rank..)
+
+# train$heldOut <- createDataPartition(train$pca.outcomes$x[,1], # considering 1st PC as output
+#                              p = proportionHeldOut, times = 1, list = FALSE)
+train$heldOut <- sample(x = 1:nrow(train$targets),
+                        size = round(proportionHeldOut * nrow(train$targets),0),
+                        replace = FALSE)
+
+# Explore nearest neighbors --------------------------------------------------------------------------------------------
+
+# configure targets and predictors - configured for regression
+predictors <- train$pca.features$x[-train$heldOut,highest.correlations] # PCs with highest correlation with outcome
+targets <- train$targets$nfkb_inhibitor[-train$heldOut] # outcomes without held out samples
+
+# train model
+fit_KNN <-
+  train(method = "knn",
+        x = predictors, 
+        y = targets, 
+        tuneGrid = data.frame(k = c(1,3,5,10,20,50,100,200,400,800,1600,2005)), # very narrow to very wide neighborhood
+        trControl = trainControl(method = 'cv', number = 5, verboseIter = TRUE, allowParallel = FALSE))
+
