@@ -84,6 +84,24 @@ train$features %>%
   summarise(count = n(), .groups = 'drop') %>% 
   arrange(desc(count))
 
+# relationship between categorical variables and outcomes
+train$targets %>% 
+  pivot_longer(cols = -sig_id,
+               names_to = "mechanism",
+               values_to = "activation") %>% 
+  left_join(select(train$features,sig_id,cp_time,cp_type,cp_dose), by = "sig_id") %>% 
+  group_by(cp_time,cp_type,cp_dose) %>% 
+  summarise(count = n(),
+            activations = sum(activation),
+            .groups = 'drop') %>% 
+  mutate(mean = activations / count) %>% 
+  arrange(desc(mean))
+
+
+
+
+
+
 # NAs in the feature space?
 train$features %>% 
   as.matrix() %>% 
@@ -801,3 +819,27 @@ fit_KNN <-
         tuneGrid = data.frame(k = c(1,3,5,10,20,50,100,200,400,800,1600,2005)), # very narrow to very wide neighborhood
         trControl = trainControl(method = 'cv', number = 5, verboseIter = TRUE, allowParallel = FALSE))
 
+# Examine a competitor's submission ------------------------------------------------------------------------------------
+
+sub <- 
+  read_csv(file.path("files","competitor_submission_001.csv")) %>% 
+  pivot_longer(cols = -"sig_id", names_to = "mechanism", values_to = "prediction")
+  
+
+sub %>% 
+  mutate(activation = round(prediction,0)) %>% 
+  summarise(mean = mean(activation),
+            sum = sum(activation),
+            min = min(prediction),
+            max = max(prediction))
+
+# Experiment with train() function -------------------------------------------------------------------------------------
+
+x <- matrix(runif(200,0,1), ncol = 2)
+colnames(x) <- c("x1","x2")
+
+y <- matrix(sample(c(0,1),100,replace=TRUE), ncol = 1) %>% as.factor
+
+fit <- train(method = "glm",
+             x = x,
+             y = y)
