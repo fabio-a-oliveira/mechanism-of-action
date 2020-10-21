@@ -43,8 +43,14 @@ pc <-
   select(-sig_id) %>% 
   prcomp()
 
+# Create outcomes approximation with N PCs -------------------------------------
+
 N <- 206
+<<<<<<< HEAD
 N <- 6
+=======
+N <- 8
+>>>>>>> e827cc8e22796e5ac88a1012d293a0e655f62d60
 
 approximation <-  pc$x[,1:N] %*% t(pc$rotation[,1:N])
 
@@ -55,7 +61,10 @@ approximation %>% as.vector %>% cut(breaks = seq(0,1,.1), include.lowest = TRUE)
 
 # Performance function ---------------------------------------------------------
 
+<<<<<<< HEAD
 # p <- pmax(pmin(round(approximation,0),1−10^−15),10^−15)
+=======
+>>>>>>> e827cc8e22796e5ac88a1012d293a0e655f62d60
 p <- pmax(pmin(approximation,1−10^−15),10^−15)
 y <- train$targets %>% select(-sig_id) %>% as.matrix()
 
