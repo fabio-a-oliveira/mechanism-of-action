@@ -1,0 +1,177 @@
+---
+title: "Predicting mechanisms of action for new drugs"
+author: "Fabio A Oliveira"
+date: "11/18/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, include = TRUE, fig.align = 'center', 
+                      out.width = '70%', out.height = '70%')
+options(width = 60)
+```
+
+```{r install and load packages, include = FALSE, results = 'hide'}
+
+if (!require("tidyverse")) {install.packages("tidyverse"); library("tidyverse")}
+if (!require("data.table")) {install.packages("data.table"); library("data.table")}
+
+
+```
+
+```{r load workspace, include = FALSE, results = 'hide'}
+
+```
+
+***
+
+## Introduction
+
+This report describes the construction of a statistical model that predicts the mechanism of action of a drug based on numeric cellular data. The problem has been proposed by the Laboratory of Innovation Science at Harvard (LISH) and is currently the subject of an ongoing machine learning competition hosted at *_kaggle.com_*.
+
+Traditionally, drugs were developed and put into use before the actual biological mechanisms through which they acted were completely understood. Today, technology has made it possible to identify proteins associated with a particular disease and to develop drugs that modulate those proteins. A *_mechanism of action_* (MoA) is a label attributed to an agent to describe its biological activity. By being able to properly identify a molecule's MoA, it can subsequently be used in a targeted manner to obtain a desired cell response.
+
+This project is part of an effort in which cellular data acquired from samples treated with drugs with known MoAs is used to construct models that will be able to identify the MoAs for new drugs.
+
+***
+
+### Dataset
+
+The full dataset has been divided by the hosts of the competition into a `train` and a `test` sets. Predictors are provided for both sets, but the actual outcomes are only provided for the `train` set.
+
+A number of files have been made available and are used in this project. They are briefly described below:
+
+* `train_features.csv` and `test_features.csv`: features for the `train` and `test` sets. Each observation corresponds to complete cellular data from as unique sample and is identified with an id in variable `sig_id`. Variables `cp_type`, `cp_time` and `cp_dose` indicate whether the sample has been treated with an actual compound or a control perturbation, the time of exposure to the compound and the dosage, respectivelly. Additionally, there are 772 variables indicating gene expression levels (`g-0` through `g-771`) and 100 variables with cell viability data (variables `c-0` through `c-99`);  
+* `train_targets_scored.csv`: outcomes for the `train` set. Each observation contains a `sig_id` matching that in the `train_features.csv` file, along with 206 binary variables, each corresponding to a particular MoA. These binary outcomes indicate wheter each mechanism is in play for the particular sample. The mechanisms are not mutually exclusive, so many samples have multiple mechanisms with a target of 1;  
+* `train_targets_nonscored.csv`: nonscored outcomes for the `train` set. These have the exact same structure as the scored targets, but with a different set of mechanisms that will not be used for calculating the final competition scores;  
+* `sample_submission.csv`: a sample file demonstrating the expected format for the submission. Submitted predictions are expected to contain observations for each of the samples in the `test` set. There must be a column for each of the scored mechanisms, containing the predicted probability that the mechanism is in effect in that sample.  
+
+Additionally, a `train_drug.csv` file has been made available after the start of the competition, containing an anonymous `drug_id` for each sample in the `train` set. Since this file has only recently been release, when this report was nearly finished, it has not been used in this project.
+
+***
+
+### Overview of the project
+
+The goal of this project is to construct a model that will predict the probability of each scored MoA for each observation in the `test` set. In order to do so, the following steps are performed:  
+
+1. The data in the `train` set is split into the `trainSingle`, `trainEnsemble` and `validate` partitions;  
+2. A selection of machine learning models is trained on the `trainSingle` set and used to make predictions for the entire dataset;  
+3. Using the predictions from the previous models, an ensemble model is trained on the `trainEnsemble` set and used to make predictions for the entire dataset;  
+4. The `validate` partition is used to report performance metrics for all models;  
+5. Predictions on the `test` set are saved to a submission file, but no performance metric is reported since there is no public file with the expected outcomes for the entries in this partition.  
+
+Each of these steps is explained in more details in the corresponding section of this report.
+
+The metric set by the hosts of the competition is the *_log loss_*, which is given by the following expression:
+
+$$log loss = - \frac{1}{M} \sum_{m=1}^{M} \frac{1}{N} \sum_{i=1}^{N}[y_{i,m} log(\hat{y}_{i,m}) + (1-y_{i,m}) log(1-\hat{y}_{i,m})]$$
+where:  
+$N$ is the number of `sig_id` observations in the test data ($i=1,...,N$)  
+$M$ is the number of scored MoA targets ($m = 1,...,M$)  
+$y_{i,m}$ is the predicted probability of a positive MoA response for a `sig_id`  
+$y_{i,m}$ is the ground truth, 1 for a positive response, 0 otherwise  
+
+The nature of the proposed problem imposes some limitations on the choice of machine learning models that can be applied to the task. Because the chosen metric evaluates the predicted probabilities rather than the predicted outcomes, the machine learning models applied here need to be selected among those capable of calculating class probabilities. Additionally, given that the targets are not mutually exclusive, this problem is in fact categorized as a *_multi-label classification task_*. Most classification algorithms are constructed so that class probabilities sum to 1, so a series of adaptations are necessary to use them in this scenario. Finally, since this is the capstone project for an online course, techniques that where presented during the course (or that are closely related to those) where preferred.
+
+The R code for this project is divided into two different files. All of the data preparation and the modeling are done in the `HX9_CYO_Main.R` script. This script prepares the data and does all of the calculations necessary for the development of the models, calculates all the predictions, and outputs the submission file. It then saves the resulting objects into files that are loaded by the `HX9_CYO_Report.RMD` script (the R Markdown script that generates this report) to create all the tables and graphics in this report.
+
+***
+
+### Relevant links
+
+The coding competition that inspired this project is hosted at <https://www.kaggle.com/c/lish-moa>.
+
+The GitHub page for this project is <https://github.com/fabio-a-oliveira/mechanisms-of-action>. 
+
+This analysis is part of the capstone project for the Data Science Professional Certificate offered by HarvardX and hosted on edX. More information can be found at <https://www.edx.org/professional-certificate/harvardx-data-science>.
+
+
+***
+
+## Methods/analyses
+
+_"a methods/analysis section that explains the process and techniques used, including data cleaning, data exploration and visualization, insights gained, and your modeling approaches (you must use at least two different models or algorithms);"_
+
+
+***
+
+### Data Preparation
+
+- load data (figure out how to load from github and unzip)
+- splits/folds
+- objetos auxiliares
+- pca
+
+***
+
+### Exploratory Data Analysis
+
+- verificar os gráficos e tabelas já feitos nos scripts anteriores
+- aplicar algo de cluster nas amostras de controle - dá pra identificar grupos de g- ou c-?
+
+***
+
+### Modeling
+
+- multilabel
+- class probs ao invés de classificação
+- chain é inadequado, maioria das probs é muito baixa
+- F_score ruim, accuracy ruim etc
+- imbalance, mas corrigir é ineficaz já que a métrica é logloss
+- limitRange para não penalizar overconfidence, balizado pelo prior do mecanismo, ajuste fino por experimentação não sistemática
+- pré processamento - PCA centróides (verificar se o PCA dos features está sendo usado por algum dos modelos que escolhi pra reportar)
+- low signal-to-noise
+
+- Decidir por tuning por logloss ou tuning por RMSE + limitRange
+
+#### Benchmark
+
+#### Logistic Regression
+
+#### KNN
+
+#### Naive Bayes
+
+#### SVM
+
+#### Multiclass PMDA
+
+#### Other models
+
+- list models that were explored without success, with short comment on limitations
+- these other models are not included in the final version of the R script
+
+#### Ensemble
+
+- simple average
+- weighted average (mean + penalized correction)
+
+
+***
+
+## Results
+
+_"a results section that presents the modeling results and discusses the model performance"_
+
+- use ensemble as final model
+
+***
+
+## Conclusion
+
+_"a conclusion section that gives a brief summary of the report, its potential impact, its limitations, and future work"_
+
+- other models are more appropriate, probably with some sort of gradient descent or boosting, as NN
+
+- combinar os dois pontos abaixo dizendo "proper CV setup", with x-fold cv + partitioning the data according to each mechanism
+- partition the data according to each mechanism, instead of partitioning the whole thing. Would preserve matching prior probabilities in the train and validate sets for every mechanism, leading to more robust modeling and more precise cross-validation. However, this is a training project, many models where constructed, simpler to do.
+- a proper x-fold cv (instead of LGOCV) would be more robust, but runtime would be too big, especially with this many models
+
+
+
+
+
+
+### PENDÊNCIAS
+
+- Explicar que, na competição, o teste é feito com amostras substituídas
