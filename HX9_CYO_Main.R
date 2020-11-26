@@ -1,16 +1,16 @@
 # Instructions ---------------------------------------------------------------------------------------------------------
 
 # If you are reading this code, here are some tips to make your life slightly easier:
+# - This code requires certain .csv files on the \files folder. You need to clone the repo or
+# download these files in order for it to run properly.
 # - This code is divided in sections roughly corresponding to the sections in the report.
 # - CTRL + SHIFT + O shows/hides the section outline of the script, making it easier to navigate.
 # - You can show/hide individual sections by clicking in the down arrow on the left.
 # - CTRL + ALT + T runs an entire section.
 # - CTRL + ENTER runs a line of code or the current selection and moves the cursor to the next line.
-# - Some parts of this code can take more than a few minutes to run; there will be comments to alert 
-#   you when appropriate.
-# - The entire code takes 3-5 hours to run on a typical personal laptop.
-# - Some parts of this code many require giving R access to additional memory and use of the hard drive to run; 
-#   there will be comments to alert you when appropriate.
+# - There are comments at the start of the section for each different model with an estimate
+# of how long it should take to run that section
+# - The entire code takes around 6 hours to run on a typical personal laptop.
 
 # HOUSEKEEPING ---------------------------------------------------------------------------------------------------------
 # Load libraries, define some global options for the script
