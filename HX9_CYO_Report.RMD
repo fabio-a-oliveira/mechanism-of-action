@@ -1,0 +1,1216 @@
+---
+title: "Predicting mechanisms of action for new drugs"
+author: "Fabio A Oliveira"
+date: "11/26/2020"
+output: pdf_document
+toc: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, cache = TRUE, include = TRUE, fig.align = 'center',
+                      error = FALSE, message = FALSE, warning = FALSE,
+                      out.width = '70%', out.height = '70%')
+options(width = 80)
+```
+
+```{r install and load packages, include = FALSE, results = 'hide'}
+
+if (!require("tidyverse")) {install.packages("tidyverse"); library("tidyverse")}
+if (!require("purrr")) {install.packages("purrr"); library("purrr")}
+if (!require("data.table")) {install.packages("data.table"); library("data.table")}
+if (!require("knitr")) {install.packages("knitr"); library("knitr")}
+if (!require("caret")) {install.packages("caret"); library("caret")}
+
+```
+
+```{r load workspace, include = FALSE, results = 'hide'}
+
+load(file.path("files","partitions.RData"))
+
+mechanisms <- read_csv(file.path("files","mechanisms.csv"), col_types = cols())
+
+predictions <-
+  fs::dir_ls("files") %>% 
+  str_subset("predictions_\\d{3}") %>% 
+  map_dfr(read_csv, col_types = cols())
+
+```
+
+```{r start train and test objects}
+
+files <-
+  list(train_features = 
+         fs::dir_ls("files") %>%
+         str_subset("train_features_\\d{2}") %>%
+         map_dfr(read_csv, col_types = cols(), ),
+       train_targets_scored = 
+         fs::dir_ls("files") %>%
+         str_subset("train_targets_scored_\\d{2}") %>%
+         map_dfr(read_csv, col_types = cols()),
+       train_targets_nonscored = 
+         fs::dir_ls("files") %>%
+         str_subset("train_targets_nonscored_\\d{2}") %>%
+         map_dfr(read_csv, col_types = cols()),
+       test_features = 
+         fs::dir_ls("files") %>%
+         str_subset("test_features_\\d{2}") %>%
+         map_dfr(read_csv, col_types = cols()))
+
+train <-
+  list(features = files$train_features,
+       outcomes = files$train_targets_scored,
+       outcomes_nonscored = files$train_targets_nonscored)
+
+test <-
+  list(features = files$test_features)
+
+rm(files)
+
+```
+
+```{r include centroids and pca in train object}
+
+# centroids for each scored mechanism
+
+train$centroids <- 
+  train$outcomes %>% 
+  filter(sig_id %in% partitions$trainSingle & !(sig_id %in% partitions$controlSamples)) %>% 
+  pivot_longer(cols = -"sig_id", names_to = "mechanism", values_to = "target") %>% 
+  filter(target == 1) %>%
+  select(-target) %>% 
+  left_join(train$features, by = "sig_id") %>% 
+  select(-cp_type,-cp_time,-cp_dose) %>%
+  group_by(mechanism) %>% 
+  summarise(across(-sig_id, mean), .groups = 'drop')
+
+# centroids for samples with no scored mechanism
+
+noMechanisms <-
+  train$outcomes %>% 
+  filter(sig_id %in% partitions$trainSingle & !(sig_id %in% partitions$controlSamples)) %>% 
+  pivot_longer(cols = -"sig_id", names_to = "mechanism", values_to = "target") %>% 
+  group_by(sig_id) %>% 
+  summarise(numMechanisms = sum(target), .groups = 'drop') %>% 
+  filter(numMechanisms == 0) %>% 
+  pull(sig_id)
+
+centroidNoMechanisms <-
+  train$features %>% 
+  filter(sig_id %in% noMechanisms) %>% 
+  select(-sig_id, -cp_type , -cp_dose, -cp_time) %>% 
+  summarise(across(everything(),mean)) %>% 
+  mutate(mechanism = 'none', .before = everything())
+
+# join centroids for each mechanism and centroid for entries with no mechanism
+
+train$centroids <- 
+  train$centroids %>% 
+  rbind(centroidNoMechanisms)
+
+# perform PCA on centroids
+
+train$pca.centroids <-
+  train$centroids %>% 
+  as.data.frame() %>% 
+  column_to_rownames("mechanism") %>% 
+  as.matrix %>% 
+  prcomp()
+
+```
+
+```{r expand features with results from pca}
+
+# calculate principal components for all samples and include in features objects
+
+train$features <- 
+  train$features %>% 
+  select(-sig_id, -cp_type, -cp_time, -cp_dose) %>% 
+  as.matrix() %>% 
+  magrittr::multiply_by_matrix(train$pca.centroids$rotation) %>% 
+  cbind(train$features) %>% 
+  select(sig_id, cp_type, cp_time, cp_dose, starts_with("g-"), starts_with("c-"), starts_with("PC"))
+
+test$features <- 
+  test$features %>% 
+  select(-sig_id, -cp_type, -cp_time, -cp_dose) %>% 
+  as.matrix() %>% 
+  magrittr::multiply_by_matrix(train$pca.centroids$rotation) %>% 
+  cbind(test$features) %>% 
+  select(sig_id, cp_type, cp_time, cp_dose, starts_with("g-"), starts_with("c-"), starts_with("PC"))
+
+# remove temporary objects
+
+rm(centroidNoMechanisms,
+   noMechanisms)
+
+```
+
+```{r declare useful functions}
+
+# epsilon - tolerance required for calculation of scores
+
+eps <- 1e-15
+
+# vector function that limits the range of an input
+
+limitRange <- function(x, xmin, xmax){x %>%  pmin(xmax) %>% pmax(xmin)}
+
+# function used to calculate the performance metric
+
+logLoss <- function(obs,pred){
+  pred <- limitRange(pred,eps,1-eps)
+  mean(-obs*log(pred) - (1-obs)*log(1-pred))
+}
+
+```
+
+***
+
+# Introduction
+
+This report describes the construction of a statistical model that predicts the mechanism of action of a drug based on numeric cellular data. The problem has been proposed by the Laboratory of Innovation Science at Harvard (LISH) and is currently the subject of an ongoing machine learning competition hosted at _**kaggle.com**_.
+
+Traditionally, drugs were developed and put into use before the actual biological mechanisms through which they acted were completely understood. Today, technology has made it possible to identify proteins associated with a particular disease and to develop drugs that modulate those proteins. A _**mechanism of action**_ _(MoA)_ is a label attributed to an agent to describe its biological activity. By being able to properly identify a molecule's _MoA_, it can subsequently be used in a targeted manner to obtain a desired cell response.
+
+This project is part of an effort in which cellular data acquired from samples treated with drugs with known _MoAs_ is used to construct models that will be able to identify the _MoAs_ for new drugs.
+
+***
+
+## Dataset
+
+The full dataset has been divided by the hosts of the competition into a `train` and a `test` sets. Predictors are provided for both sets, but the actual outcomes are only provided for samples in the `train` set.
+
+A number of files have been made available and are used in this project. They are briefly described below:
+
+* `train_features.csv` and `test_features.csv`: features for the `train` and `test` sets. Each observation corresponds to complete cellular data from an unique sample and is identified with an id in variable `sig_id`. Variables `cp_type`, `cp_time` and `cp_dose` indicate whether the sample has been treated with an actual compound or a control perturbation, the time of exposure to the compound and the dosage, respectivelly. Additionally, there are 772 variables indicating gene expression levels (`g-0` through `g-771`) and 100 variables with cell viability data (variables `c-0` through `c-99`);  
+* `train_targets_scored.csv`: outcomes for the `train` set. Each observation contains a `sig_id` matching that in the `train_features.csv` file, along with 206 binary variables, each corresponding to a particular _MoA_. These binary outcomes indicate wheter each mechanism is in play for the particular sample. The mechanisms are not mutually exclusive, so many samples have multiple mechanisms with a target of 1;  
+* `train_targets_nonscored.csv`: nonscored outcomes for the `train` set. These have the exact same structure as the scored targets, but with a different set of mechanisms that will not be used for calculating the final competition scores;  
+* `sample_submission.csv`: a sample file demonstrating the expected format for the submission. Submitted predictions are expected to contain observations for each of the samples in the `test` set. There must be a column for each of the scored mechanisms, containing the predicted probability that the mechanism is in effect in that sample.  
+
+Additionally, a `train_drug.csv` file has been made available after the start of the competition, containing an anonymous `drug_id` for each sample in the `train` set. Since this file has only recently been release, when this report was nearly finished, it has not been used in this project.
+
+***
+
+## Overview of the project
+
+The goal of this project is to construct a model that will predict the probability of each scored _MoA_ for each observation in the `test` set. In order to do so, the following steps are performed:  
+
+1. The data in the `train` set is split into the `trainSingle`, `trainEnsemble` and `validate` partitions;  
+2. A selection of machine learning models is trained on the `trainSingle` set and used to make predictions for the entire dataset;  
+3. Using the predictions from the previous models, an ensemble model is trained on the `trainEnsemble` set and used to make predictions for the entire dataset;  
+4. The `validate` partition is used to report performance metrics for all models;  
+5. Predictions on the `test` set are saved to a submission file, but no performance metric is reported since there is no public file with the expected outcomes for the entries in this partition.  
+
+Each of these steps is explained in more details in the corresponding section of this report.
+
+The metric set by the hosts of the competition is the _**log loss**_, which is given by the following expression:
+
+$$log loss = - \frac{1}{M} \sum_{m=1}^{M} \frac{1}{N} \sum_{i=1}^{N}[y_{i,m} log(\hat{y}_{i,m}) + (1-y_{i,m}) log(1-\hat{y}_{i,m})]$$
+where:  
+$N$ is the number of `sig_id` observations in the test data ($i=1,...,N$)  
+$M$ is the number of scored _MoA_ targets ($m = 1,...,M$)  
+$y_{i,m}$ is the predicted probability of a positive _MoA_ response for a `sig_id`  
+$y_{i,m}$ is the ground truth, 1 for a positive response, 0 otherwise  
+
+The nature of the proposed problem imposes some limitations on the choice of machine learning models that can be applied to the task. Because the chosen metric evaluates the predicted probabilities rather than the predicted outcomes, the machine learning models applied here need to be selected among those capable of calculating class probabilities. Additionally, given that the targets are not mutually exclusive, this problem is in fact categorized as a _**multi-label classification task**_. Most classification algorithms are constructed so that class probabilities sum to 1, so a series of adaptations are necessary to use them in this scenario. Finally, since this is the capstone project for an online course, techniques that where presented during the course (or that are closely related to those) where preferred.
+
+The _R_ code for this project is divided into two different files. All of the data preparation and the modeling are done in the `HX9_CYO_Main.R` script. This script prepares the data and does all of the calculations necessary for the development of the models, calculates all the predictions, and outputs the submission file. It then saves the resulting objects into files that are loaded by the `HX9_CYO_Report.RMD` script (the _R Markdown_ script that generates this report) to create all the tables and graphics in this report.
+
+***
+
+## Relevant links
+
+The coding competition that inspired this project is hosted at <https://www.kaggle.com/c/lish-MoA>.
+
+The GitHub page for this project is <https://github.com/fabio-a-oliveira/mechanisms-of-action>. 
+
+This analysis is part of the capstone project for the Data Science Professional Certificate offered by HarvardX and hosted on edX. More information can be found at <https://www.edx.org/professional-certificate/harvardx-data-science>.
+
+
+***
+
+# Methods & analyses
+
+Before attempting to construct models to predict the mechanisms in action for each sample in the dataset, steps were taken to load the data, organize it into _R_ objects appropriate for analysis and perform a thorough exploratory data analysys to gain valuable insights.
+
+Then, a two-step approach was taken to build the statistical model:  
+
+1. A series of models were constructed using the `trainSingle` partition. During this step, the provided features were used to make predictions for the probability of a positive outcome for each of the _MoAs_;
+2. A ensemble model was constructed using the models developed during the previous step. At this stage, the predictions made by each model on the `trainEnsemble` set were used as features for the construction of the ensemble model.
+
+***
+
+## Data Preparation
+
+This section addresses the steps taken in preparing the data for analysis and modeling.    
+ 
+### Load data
+
+The full set of files used for this project is provided by _kaggle_ as a _.zip_ file, containing all the data in _.csv_ format. Unfortunately, _kaggle_ does not provide a way to download datasets programmatically using _R_ (there is an API for _Python_ though). In order to meet the capstone project requirement that all the data must either be automatically downloaded from the _R_ script or provided on a GitHub repository, the files were unzipped and uploaded to GitHub.  
+
+However, GitHub imposes a 10MB file size limit on their free accounts, so the _.csv_ files where split into smaller ones, each containing a chunk of the original data. The resulting predictions made by each model are also loaded to GitHub in the same manner.
+
+Upon navigating the repository online or cloning it to a machine, one will be able to identify all the files in the _/files_ folder. These are loaded by the _HX9_CYO_Main.R_ script and used to perform all the analyses.
+
+### Partition data
+
+As discussed previously, the full set of observations had already been split by the sponsors of the competition into a `train` and a `test` sets. Outcomes were only provided for the `train` set, so further splits where necessary in order to allow for two stages of modeling and for performance measurements.
+
+For the purposes of this project, the original `train` set has been split into three partitions:  
+
+1. The `trainSingle` partition is used for the first stage of modeling and contains 80% of the samples in the `train` set;
+2. The `trainEnsemble` partition is used for the second stage of modeling (an ensemble of the models in the first stage) and contains 10% of the samples in the `train` set;
+3. The `validate` partition is only used for measuring the final performance of the full model and contains 10% of the samples in the `train` set.
+
+Additionally, some code is included int the _HX9_CYO_Main.R_ script to ensure that the `trainSingle` partition contains at least one positive sample for each of the _MoAs_ and that the `trainEnsemble` contains at least one positive sample for the _MoAs_ present in the `validate` set.
+
+### Auxiliary variables
+
+Before proceding with the analysis, the data has been organized into a set of _R_ variables so as to facilitate manipulation. 
+
+* The `train` object was created as a list of objects containing the full set of features, scored and non-scored targets on the `train` set. It also contained a PCA object with results from a principal component analysis on the features in the `trainSingle` partition, as well as a data frame containing coordinates of the centroids of each of the mechanisms in the feature space;  
+* The `test` object was created as a list with the data frame of features in the `test` partition;   
+* The `partitions` object was created as a list of character vectors, with each list containing the `sig_id` unique identifier for the samples in the appropriate partition. Apart from the `trainSingle`, `trainEnsemble`, `validate` and `test` partitions, character vectors were also included with the control samples (which have no mechanism by definition) and with the train samples without any mechanisms;  
+* The `predictions` object was created as a data frame in tidy format, with one observation for each combination of samples and mechanisms. During the modeling phase, predictions made by each of the different models were added as new variables to this data frame.  
+* The `mechanisms` object was created as a data frame with relevant information pertaining to each of the individual mechanisms. For each mechanism, a corresponding entry with its name, whether it would be scored or not, and its prevalence (proportion of positive outcomes) in the `trainSingle` partition.   
+
+### Principal components analysis
+
+Due to the large number of predictors (875 in total), a principal component analysis _(PCA)_ was performed as a dimensionality reduction technique.
+
+Normally, the `prcomp()` function in _R_ would be applied to the full set of predictors, generating a rotation to a coordinate system with uncorrelated predictors each accounting for a decreasing proportion of the total variability. However, this technique has a limitation in the fact that it is _unsupervised_: the resulting predictors are not dependent on the actual outcome the models will attempt to predict. This means that, even though predictors are ordered according to their total variance, they are not necessarily relevant in distinguishing between different classes.
+
+Thus, an adaptation to the principal component analysis technique was applied. First, the samples in the `trainSingle` partition were grouped according to the _MoAs_ for which they had a positive outcome. This information was then used to calculate the centroids for each of the mechanisms. Finally, the matrix containing the coordinates (in the feature space) for each of the centroids went through a _PCA_ with the `prcomp()` function.
+
+This amounts to a rotation to a coordinate system corresponding to the hyperplane connecting each class' centroid. In the case of uncorrelated predictors, this rotated coordinate system is optimal for a classification task.
+
+The following figure illustrates this approach for a 2-class scenario:   
+
+```{r}
+
+N = 100
+
+rbind(data.frame(x = rnorm(N, 1, 1),
+                 y = rnorm(N, -1, 1),
+                 class = '1'),
+      data.frame(x = rnorm(N, -1, 1),
+                 y = rnorm(N, 1, 1),
+                 class = '2')) %>% 
+  ggplot(aes(x = x, y = y, color = class)) +
+  geom_point(size = 2) +
+  geom_point(data = data.frame(x = c(1,-1), y = c(-1,1), class = c('1','2')),
+             aes(x = x, y = y), inherit.aes = FALSE, size = 4) +
+  geom_abline(slope = -1, intercept = 0, size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = 'dotdash', size = 1) +
+  scale_x_continuous(limits = c(-2,2)) +
+  scale_y_continuous(limits = c(-2,2)) +
+  theme(axis.title = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(), 
+        axis.line = element_blank(), legend.position = 'none', panel.grid = element_blank(), aspect.ratio = 1) +
+  labs(title = "Classification problem with 2 classes and 2 predictors")
+
+rm(N)
+
+```
+_**FIGURE**: Observations for two classes plotted as points with different colors. Black points show their respective centroids. The solid line connects the centroids and defines the 1-dimension hyperplane along which the separation is optimal (for uncorrelated predictors). It corresponds to the direction of the first principal component. The distance between each observation and the solid line is irrelevant for classification and corresponds to the second principal component. The dashed line shows the optimal separating line._
+
+***
+
+## Exploratory Data Analysis
+
+In this section, we describe the dataset which is the subject of the project. We first glimpse at `train` and `test` sets, in order to understand their relative sizes, amount of samples and variables. Then, we look more closely to the outcomes which we attempt at predicting, and finally at the predictors available for the task.
+
+### Overview of the dataset
+
+We begin by looking at the structure of the first 10 columns of the scored outcomes object:
+
+```{r structure of the scored outcomes}
+
+train$outcomes[,1:10] %>% 
+  glimpse()
+
+```
+We see that this object is comprised of the `sig_id` column, representing an unique identifier for each of the 23,814 samples in the `train` set. Additional columns are present for each of the scored mechanisms. Active mechanisms for a given sample are encoded with a "1", while others are encoded with "0".
+
+The non-scored mechanisms are arranged similarly, with the `sig_id` column followed by binary variables indicating the active _MoA_.
+
+```{r structure of non-scored outcomes}
+
+train$outcomes_nonscored[,1:10] %>% 
+  glimpse()
+
+```
+Then, we look at features available for prediction. There are several hundred columns with the different predictors, so we start by looking at the names of the first few:
+
+```{r names of the features}
+
+options("max.print" = 28)
+
+train$features %>% 
+  names()
+
+```
+Similarly to the outcomes, there is a `sig_id` column with an unique identifier for each sample, followed by the remainder of the predictors. Below we see a glimpse at the first four columns:
+
+```{r first four columns of train features}
+
+train$features %>%
+  select(sig_id, cp_type, cp_time, cp_dose) %>% 
+  glimpse()
+
+```
+We can see that the `train` set contains 23,814 observations, each characterized by an unique identifier in column `sig_id`.
+
+Below we see a summary of the `cp_type`, `cp_time`, and `cp_dose` variables:
+
+```{r summary of cp_ variables}
+
+train$features %>% 
+  select(cp_type, cp_time, cp_dose) %>% 
+  mutate(across(everything(),as.factor)) %>% 
+  summary()
+
+```
+We notice that `cp_type` has two levels: `ctl_vehicle`, which corresponds to samples where no agent has been applied and that by definition have no active _MoA_; and `trt_cp`, corresponding to samples with an agent that may have an active _MoA_. Additionally, `cp_time` and `cp_dose` indicate the time of exposure (24, 48 or 72 hours) and the dosage (D1 or D2).
+
+The remaining 872 predictors account for the majority of the features and are comprised of expression levels measured for a selection of 772 genes (variables `g-0` through `g-771`) and 100 variables related to cell viability (variables `c-0` through `c-99`).
+
+On the `test` set, we see the same variables for in a total of 3982 samples. The structure of the first four columns is shown below:
+
+```{r first four columns of test features}
+
+test$features %>%
+  select(sig_id, cp_type, cp_time, cp_dose) %>% 
+  glimpse()
+
+```
+We proceed to explore the composition of the `train` and `test` sets and the relations between the different variables in more detail.
+
+### Outcomes
+
+As described above, the dataset contains the ground truth for the `train` set, with a total of 608 different mechanisms of action. Out of this total, 206 were selected by the hosts of the competition as scored mechanisms, for which the performance metrics will be calculated. The remaining 402 mechanisms may be used in the models, but will not count for performance calculation and should not be part of the submission.
+
+The following table contains totals for the scored and nonscored mechanisms, as seen in the `train` set. We see that the scored mechanisms correspond to roughly 1/3 of the total (206 from a total of 408), but they are more frequent on average.
+
+```{r scored and nonscored mechanisms}
+
+train$outcomes %>% 
+  left_join(train$outcomes_nonscored, by = "sig_id") %>% 
+  pivot_longer(cols = -"sig_id", names_to = "mechanism", values_to = "target") %>% 
+  left_join(select(mechanisms,mechanism,source), by = "mechanism") %>% 
+  group_by(mechanism, source) %>% 
+  summarise(prevalence = mean(target), .groups = "drop") %>% 
+  group_by(source) %>% 
+  summarise(`number of mechanisms` = n(),
+            `mean prevalence` = mean(prevalence), .groups = "drop") %>% 
+  arrange(desc(source)) %>% 
+  kable(caption = "distribution of mechanisms in scored and nonscored sets",
+        digits = 6, row.names = TRUE)
+
+```
+
+The following table shows their distribution with some additional details.
+
+```{r summary of outcomes}
+
+train$outcomes %>% 
+  left_join(train$outcomes_nonscored, by = "sig_id") %>% 
+  pivot_longer(cols = -"sig_id", names_to = "mechanism", values_to = "target") %>% 
+  left_join(mechanisms, by = "mechanism") %>% 
+  group_by(sig_id) %>%
+  summarise(`total positive mechanisms` = sum(target),
+            `total scored mechanisms` = sum(target == 1 & source == "scored"),
+            `total nonscored mechanisms` = sum(target == 1 & source == "nonscored"),
+            .groups = "drop") %>%
+  summarise(`mean positive mechanisms` = mean(`total positive mechanisms`),
+            `mean scored mechanisms` = mean(`total scored mechanisms`),
+            `mean nonscored mechanisms` = mean(`total nonscored mechanisms`),
+            `most mechanisms in single sample` = max(`total positive mechanisms`),
+            `most scored mechanisms in single sample` = max(`total scored mechanisms`),
+            `proportion of samples with at least one positive mechanism` = mean(`total positive mechanisms` >= 1),
+            `proportion of samples with no mechanisms` = mean(`total positive mechanisms` == 0),
+            .groups = "drop") %>%
+  pivot_longer(cols = everything(), names_to = "metric", values_to = "value") %>%
+  knitr::kable(caption = "basic statistics on outcomes",
+               digits = 3, row.names = TRUE)
+
+```
+
+Wee see that many of the available samples have several positive outcomes for different mechanisms, with one sample in particular showing as many as 11 positive targets. Meanwhile, there is a significant proportion of samples without any active mechanisms. We can see the distribution of the number of different mechanisms per sample in the tables below, when considering all the mechanisms and only the scored mechanisms:
+
+```{r distribution of total number of positive mechanisms}
+
+df.all <- 
+  train$outcomes %>% 
+  left_join(train$outcomes_nonscored, by = "sig_id") %>% 
+  pivot_longer(cols = -"sig_id", names_to = "mechanism", values_to = "target") %>% 
+  group_by(sig_id) %>% 
+  summarise(`total number of positive mechanisms` = sum(target), .groups = "drop") %>% 
+  pull(`total number of positive mechanisms`) %>% 
+  table() %>% 
+  as.data.frame()
+  
+df.scored <-
+  train$outcomes %>% 
+  pivot_longer(cols = -"sig_id", names_to = "mechanism", values_to = "target") %>% 
+  group_by(sig_id) %>% 
+  summarise(`total number of positive mechanisms` = sum(target), .groups = "drop") %>% 
+  pull(`total number of positive mechanisms`) %>% 
+  table() %>% 
+  as.data.frame()
+
+df.all %>% 
+  left_join(df.scored, by = ".") %>% 
+  rename("numMechanisms" = ".") %>% 
+  replace_na(list(Freq.y = 0)) %>% 
+  kable(caption = "number of positive targets per sample", 
+        col.names = c("number of mechanisms", "scored & nonscored", "scored only"), 
+        row.names = TRUE)
+
+rm(df.all, df.scored)
+
+```
+
+Many samples do not have a known active mechanism of action, and the majority have one. However, a significant portion of the samples have multiple active mechanisms, which indicates that the task of predicting the _MoA_ is not a simple multi-class classification task, but a _multi-label classification task_ instead. To illustrate the difference, we look at the set of all outcomes present in the `train` set (considering only the scored mechanisms for simplicity).
+
+```{r different outcomes present in the train set}
+
+train$outcomes %>% 
+  pivot_longer(cols = -"sig_id", names_to = "mechanism", values_to = "target") %>% 
+  filter(target == 1) %>% 
+  group_by(sig_id) %>% 
+  summarise(outcome = str_c(mechanism, collapse = " | "),
+            `mechanisms` = n(),
+            .groups = "drop") %>% 
+  group_by(outcome, `mechanisms`) %>% 
+  summarise(instances = n(), .groups = "drop") %>% 
+  arrange(desc(`mechanisms`)) %>% 
+  filter(mechanisms >= 4) %>%   
+  select(-mechanisms) %>% 
+  kable(caption = "combinations of MoAs found in train set with 4 or more single mechanisms",
+        row.names = TRUE)
+
+```
+
+We now turn our attention to the individual mechanisms. The table below shows the top 10 most frequent mechanisms, with their number of positive outcomes and the prevalence (proportion of positive outcomes over total samples). We notice that all of these most frequent _MoAs_ are part of the scored set, for which performance will be evaluated.
+
+```{r frequency of individual mechanisms (table)}
+
+train$outcomes %>% 
+  left_join(train$outcomes_nonscored, by = "sig_id") %>% 
+  pivot_longer(cols = -"sig_id", names_to = "mechanism", values_to = "target") %>% 
+  group_by(mechanism) %>% 
+  summarise(positives = sum(target),
+            prevalence = mean(target), 
+            .groups = "drop") %>% 
+  left_join(select(mechanisms,mechanism,source), by = "mechanism") %>% 
+  select(mechanism,source,positives,prevalence) %>% 
+  arrange(desc(prevalence)) %>% 
+  head(10) %>%
+  kable(caption = "mechanisms arranged by prevalence on train set", 
+        digits = 3, row.names = TRUE)
+```
+
+The figure below shows the prevalence in more details, with the scored and nonscored mechanisms in separate plots.
+
+```{r frequency of individual mechanisms (graph)}
+train$outcomes %>% 
+  left_join(train$outcomes_nonscored, by = "sig_id") %>% 
+  pivot_longer(cols = -"sig_id", names_to = "mechanism", values_to = "target") %>% 
+  group_by(mechanism) %>% 
+  summarise(positives = sum(target),
+            prevalence = mean(target), 
+            .groups = "drop") %>% 
+  left_join(select(mechanisms,mechanism,source), by = "mechanism") %>% 
+  select(mechanism,source,positives,prevalence) %>% 
+  arrange(prevalence) %>% 
+  group_by(source) %>% 
+  mutate(nrow = row_number()) %>% 
+  ggplot(aes(x = nrow, y = prevalence, color = source)) +
+  geom_point() +
+  facet_wrap(source ~ ., ncol = 2, scales = "free_x") +
+  scale_y_continuous(trans = "sqrt") +
+  theme(legend.position = "none") +
+  labs(title = "Prevalence of scored and nonscored MoAs in the train set",
+       x = "Mechanisms \n(ordered according to prevalence)", y = "Prevalence \n(proportion of positive outcomes)")
+
+```
+_**FIGURE:** Proportion of positive outcomes for each mechanism of action, measured in the train set. Prevalence is scaled with the sqrt() function. Nonscored mechanisms amount to around 2/3 of the total, but the most frequent ones are in the scored set. Only the two of the most common mechanisms are present in over 3% of the samples._
+
+The figure makes it evident that the prevalence varies widely. Mechanism `nfkb_inhibitor` is the most common, with 832 positive outcomes in the `train` set, followed by `proteasome_inhibitor` with 726. In contrast, some mechanisms only appear a few times. It is relevant then to investigate the concentration of positive outcomes in the most common mechanisms.
+
+```{r cumulative proportion of positive outcomes}
+
+train$outcomes %>% 
+  pivot_longer(cols = -"sig_id", names_to = "mechanism", values_to = "target") %>% 
+  filter(target == 1) %>% 
+  group_by(mechanism) %>% 
+  summarise(count = n()) %>% 
+  arrange(desc(count)) %>% 
+  mutate(number = row_number(),
+         cumsum = cumsum(count),
+         cumprop_positives = cumsum(count)/sum(count)) %>% 
+  ggplot(aes(x = number, y = cumprop_positives)) +
+  geom_line(color = 'blue', size = 2) + 
+  scale_x_continuous(breaks = seq(0,206,20)) +
+  scale_y_continuous(labels = scales::percent, breaks = seq(0,1,.1)) +
+  labs(title = "Cumulative percentage of positive outcomes \n(scored mechanisms only)",
+       x = "Number of mechanisms", y = "Cumulative percentage")
+
+```
+_**FIGURE:** Cumulative proportion of positive outcomes in the scored mechanisms set. The 24 most common MoAs account for 50% of the positive outcomes, while the 116 most common account for 90%._
+
+With the vast amount of mechanisms whose outcomes we attempt at predicting, and the fact that they are not mutually exclusive, it is relevant to investigate whether some mechanisms present a high correlation. To see that, we apply the `cor()` function to the matrix containing the binary outcomes for each mechanism and each sample, and arrange the results into a data frame with correlations for each pair of mechanisms:
+
+```{r correlation between individual mechanisms}
+
+train$outcomes %>% 
+  select(-sig_id) %>% 
+  as.matrix() %>% 
+  cor() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("mechanism_1") %>% 
+  pivot_longer(cols = -"mechanism_1", names_to = "mechanism_2", values_to = "correlation") %>% 
+  filter(mechanism_1 < mechanism_2) %>% 
+  unite("pair of mechanisms", mechanism_1, mechanism_2, sep = " & ") %>% 
+  arrange(desc(abs(correlation))) %>% 
+  filter(abs(correlation) >= .25) %>% 
+  kable(caption = "pairs of mechanisms with correlation larger than .25", 
+        digits = 3, row.names = TRUE)
+
+```
+
+We see from the table that only 18 pairs of mechanisms have a correlation above .25 (out of a total of $\binom{206}{2} = 21115$ possible pairs). This indicates that the task of predicting the probability of a positive outcome can be treated as an independent prediction task for each of the mechanisms.
+
+### Predictors
+
+We now move to the analysis of the predictors contained in the dataset and of how they relate to the known outcomes in the `train` set.
+
+The following three tables show the effects of variables `cp_type`, `cp_time`, and `cp_dose` in the proportion of samples with positive outcomes for the scored mechanisms.
+
+```{r cp_ variables}
+
+train$features %>% 
+  select(sig_id, cp_type) %>% 
+  left_join(train$outcomes, by = "sig_id") %>% 
+  pivot_longer(cols = -c("sig_id","cp_type"), names_to = "mechanism", values_to = "target") %>% 
+  group_by(sig_id, cp_type) %>% 
+  summarise(numMechanisms = sum(target), .groups = "drop") %>% 
+  group_by(cp_type) %>% 
+  summarise(`samples with any MoA` = mean(numMechanisms >= 1),
+            `samples with no MoA` = mean(numMechanisms == 0),
+            `average positive outcomes` = mean(numMechanisms),
+            .groups = "drop") %>% 
+  kable(caption = "effect of cp_type variable on amount of outcomes",
+        digits = 3, row.names = TRUE)
+
+train$features %>% 
+  select(sig_id, cp_time) %>% 
+  left_join(train$outcomes, by = "sig_id") %>% 
+  pivot_longer(cols = -c("sig_id","cp_time"), names_to = "mechanism", values_to = "target") %>% 
+  group_by(sig_id, cp_time) %>% 
+  summarise(numMechanisms = sum(target), .groups = "drop") %>% 
+  group_by(cp_time) %>% 
+  summarise(`samples with any MoA` = mean(numMechanisms >= 1),
+            `samples with no MoA` = mean(numMechanisms == 0),
+            `average positive outcomes` = mean(numMechanisms),
+            .groups = "drop") %>% 
+  kable(caption = "effect of cp_time variable on amount of outcomes",
+        digits = 3, row.names = TRUE)
+
+train$features %>% 
+  select(sig_id, cp_dose) %>% 
+  left_join(train$outcomes, by = "sig_id") %>% 
+  pivot_longer(cols = -c("sig_id","cp_dose"), names_to = "mechanism", values_to = "target") %>% 
+  group_by(sig_id, cp_dose) %>% 
+  summarise(numMechanisms = sum(target), .groups = "drop") %>% 
+  group_by(cp_dose) %>% 
+  summarise(`samples with any MoA` = mean(numMechanisms >= 1),
+            `samples with no MoA` = mean(numMechanisms == 0),
+            `average positive outcomes` = mean(numMechanisms)) %>% 
+  kable(caption = "effect of cp_dose variable on amount of outcomes",
+        digits = 3, row.names = TRUE)
+  
+
+```
+
+We see that, as expected, samples with `ctl_vehicle` on the `cp_type` variable have no _MoA_. As for the other two variables shown above, there is virtually no effect on the proportion of samples with positive outcomes.
+
+We now turn our attention to the gene expression and cell viability features, which account for the vast majority of the available predictors.
+
+```{r plot gene expression and cell viability}
+
+train$features %>% 
+  rbind(test$features) %>% 
+  select(starts_with("c-"), starts_with("g-")) %>% 
+  pivot_longer(cols = everything(), names_to = "feature", values_to = "value") %>% 
+  group_by(feature) %>% 
+  summarise(min = min(value),
+            quantile1 = quantile(value, .25),
+            median = quantile(value, .50),
+            mean = mean(value),
+            quantile3 = quantile(value,.75),
+            max = max(value),
+            .groups = "drop") %>% 
+  mutate(type = if_else(str_detect(feature,"c-"), "cell viability", "gene expression")) %>% 
+  ggplot(aes(x = feature, y = median)) +
+  geom_point() +
+  geom_point(aes(x = feature, y = max), color = 'blue', size = .5) +
+  geom_point(aes(x = feature, y = min), color = 'blue', size = .5) +
+  geom_point(aes(x = feature, y = quantile1), color = 'red', size = .5) +
+  geom_point(aes(x = feature, y = quantile3), color = 'red', size = .5) +
+  facet_wrap(type ~ ., ncol = 2, scales = "free_x") +
+  theme(axis.title = element_blank(), axis.text.x = element_blank(), axis.ticks.x = element_blank(),
+        axis.line = element_blank(), panel.grid = element_blank()) +
+  labs(title = "Quartiles for each of the c- and g- features in the dataset")
+
+```
+_**FIGURE:** Quartiles for each of the cell viability and gene expression features in the dataset. The black points in the center are the median for each feature. The two lines of red points below and above the center mark the 1st and 3rd quartiles, and the blue points at the bottom and top are the minimum and maximum._
+
+From the figure above, we see that the cell viability and gene expression features are already nearly centered, and that the interquartile range (IQR) is relatively narrow in comparison with the minimum and maximum values. We also notice that both sets of features are limited to the -10:10 range, which may indicate that they have already been pre-processed according to standard practices in this subject matter.
+
+We proceed with an evaluation of the results of a principal components analysis on the `c-` and `g-` features. As discussed in the Data Preparation section above, we choose to apply this dimensionality reduction technique to the set of class centroids, with the goal of finding a coordinate system better suited for the classification task. We also limit the scope of the PCA to the samples in the `trainSingle` partition, so as to avoid data leakage between the partitions leading to overconfident performance estimates.
+
+The figure below shows the cumulative proportion of variance explained by the principal components. We see that there is a significant concentration of the total variance in the first few coordinates, which is an important indication that the prediction problem can be well represented in a reduced feature space.
+
+```{r results of the pca on the class centroids}
+
+data.frame(PC = 0:207,
+           SD = c(0,train$pca.centroids$sdev)) %>% 
+  mutate(variance = SD^2,
+         cumprop = cumsum(variance)/sum(variance)) %>% 
+  ggplot(aes(x = PC, y = cumprop)) +
+  geom_line(size = 2, color = 'blue') +
+  scale_x_continuous(limits = c(0,100), breaks = seq(0,100,20)) +
+  scale_y_continuous(limits = c(0,1), breaks = seq(0,1,.2)) +
+  labs(title = "Principal Component Analysis \n (cumulative proportion of variance)", 
+       x = "number of principal components \n (first 100 out of 207)",
+       y = "cumulative proportion of variance")
+
+```
+_**FIGURE:** cumulative proportion of total variance after application of PCA to the class centroids. Only 3 PCs are necessary to account for 75% of the total variance, while 41 PCs account for 95%._
+
+It is worth noting that `prcomp()` returned 207 principal components (one more than the 206 scored mechanisms). This is due to the inclusion of an additional centroid in the analysis, corresponding to the samples with no positive mechanisms.
+
+Finally, we look at how effective the principal components seem to be in separating the positive from the negative targets. The figure below shows a scatter plot with a sample containing equal amounts of positive and negative outcomes for a selection of the most frequent _MoAs_, situated according to the first and second principal components.
+
+```{r scatter plot of selection of mechanisms}
+
+train$features %>% 
+  left_join(train$outcomes, by = "sig_id") %>% 
+  select(PC1, PC2, 
+         any_of(mechanisms %>% 
+                  arrange(desc(prevalence)) %>% 
+                  head(6) %>% 
+                  pull(mechanism))) %>% 
+  pivot_longer(cols = -c("PC1","PC2"), names_to = "mechanism", values_to = "target") %>% 
+  group_by(mechanism, target) %>% 
+  sample_n(50) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = PC1, y = PC2, color = factor(target))) +
+  geom_point(alpha = .5, size = 1) +
+  scale_color_manual(values = c("red", "blue")) +
+  facet_wrap(mechanism ~ ., nrow = 2) +
+  theme(legend.position = 'none') +
+  labs(title = "Targets as a function of 1st and 2nd principal components")
+
+```
+_**FIGURE:** scatter plots of outcomes as a function of first and second principal components for a selection of mechanisms. Red dots represent negative targets, while blue dots represent positive ones. The selected mechanisms are the ones with higher prevalence. Each plot contains 50 positive and 50 negative outcomes._
+
+These scatter plots provide an optimistic outlook for the classification problem. Mechanisms `nfkb_inhibitor` and `proteasome_inhibitor` (which happen to be the two most frequent) are very neatly clustered on the right of the PC1/PC2 plane. One might expect that the other mechanisms would be as clearly separated when looking at a different combination of principal components. However, that does not happen to be the case. A scatter plot matrix for the `cyclooxygenase_inhibitor` mechanism (the third most common) and other pairs of PCs illustrate the situation.
+
+```{r scatter plots for cyclooxygenase_inhibitor mechanism}
+
+train$features %>% 
+  left_join(train$outcomes %>% select(sig_id, cyclooxygenase_inhibitor),
+            by = "sig_id") %>% 
+  select(sig_id, any_of(paste("PC",1:5,sep="")), cyclooxygenase_inhibitor) %>% 
+  group_by(cyclooxygenase_inhibitor) %>% 
+  sample_n(20) %>% 
+  ungroup() %>% 
+  pivot_longer(cols = -c("sig_id","cyclooxygenase_inhibitor"), names_to = "first_PC", values_to = "first_value") %>% 
+  left_join(train$features %>% select(sig_id, any_of(paste("PC",1:5,sep=""))),
+            by = "sig_id") %>% 
+  pivot_longer(cols = any_of(paste("PC",1:5,sep="")), names_to = "second_PC", values_to = "second_value") %>% 
+  filter(first_PC != second_PC) %>% 
+  ggplot(aes(x = first_value, y = second_value, color = factor(cyclooxygenase_inhibitor))) +
+  geom_point(alpha = .4, size = 1) +
+  scale_color_manual(values = c("red", "blue")) +
+  facet_grid(first_PC ~ second_PC, scales = "free") +
+  theme(legend.position = 'none', axis.title = element_blank(), 
+        axis.text = element_blank(), axis.ticks = element_blank(),
+        axis.line = element_blank(), panel.grid = element_blank()) +
+  labs(title = "Scatter plot matrix for cyclooxygenase_inhibitor mechanism")
+
+```
+_**FIGURE:** scatter plot matrix for the cyclooxygenase_inhibitor mechanism and the five first principal components. Red dots indicate a negative outcome and blue dots indicate a positive one. A random sample of 20 positive and 20 negative outcomes was selected. Although some negative samples are spread out away from the origin at each of the plots, the majority of samples are concentrated in a single cluster, regardless of the outcome. There is no clear separating line in any of the plots._
+
+The setup we see for this particular mechanism is typical of the entire selection. Similar scatter plot matrices for other _MoAs_ show a very similar distribution of positive and negative outcomes. This indicates that, for the majority of the mechanisms, the classification algorithms will have difficulty in identifying positive outcomes.
+
+The table below demonstrates this point for the entire set of mechanisms and principal components. Out of a total of $206 \times 207 = 42,642$ pairs of mechanisms and principal components, only 16 have the absolute value of the correlation larger than 15%.
+
+```{r correlation between outcomes and principal components}
+
+cor(train$outcomes %>% select(-sig_id) %>% as.matrix,
+    train$features %>% select(starts_with("PC")) %>% as.matrix) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("mechanism") %>% 
+  pivot_longer(cols = -"mechanism", names_to = "PC", values_to = "correlation") %>% 
+  group_by(mechanism) %>% 
+  summarise(PC = PC[which.max(abs(correlation))],
+            correlation = correlation[which.max(abs(correlation))]) %>% 
+  arrange(desc(abs(correlation))) %>% 
+  filter(abs(correlation) > 0.15) %>% 
+  kable(caption = "mechanisms with at least one PC having abs(cor) > 15%",
+        row.names = TRUE)
+
+```
+
+To make sure that this limitation is not a result of a poor choice of pre-processing technique, we look at a similar table addressing the correlations between the outcomes and the original predictors:
+
+```{r correlation between outcomes and c- and g- features}
+
+cor(train$outcomes %>% select(-sig_id) %>% as.matrix,
+    train$features %>% select(starts_with("g-"), starts_with("c-")) %>% as.matrix) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("mechanism") %>% 
+  pivot_longer(cols = -"mechanism", names_to = "predictor", values_to = "correlation") %>% 
+  group_by(mechanism) %>% 
+  summarise(predictor = predictor[which.max(abs(correlation))],
+            correlation = correlation[which.max(abs(correlation))],
+            .groups = "drop") %>% 
+  arrange(desc(abs(correlation))) %>% 
+  filter(abs(correlation) > 0.15) %>% 
+  kable(caption = "mechanisms with at least one predictor having abs(cor) > 15%",
+        row.names = TRUE)
+
+
+```
+
+The table shows that the poor correlation between the outcomes and the predictors is a feature of the original dataset.
+
+***
+
+## Modeling
+
+After having performed an exploratory data analysis of the dataset in the previous section, we have sufficient information to decide on the appropriate modeling approaches.
+
+The first relevant insight is that the problem is categorized as a _multi-label classification task_. The different possible outcomes are not mutually exclusive, which means that the task cannot be formulated as a "choose the most likely among the different possibilities" problem. In fact, we have seen that the different mechanisms are barely correlated at all. 
+
+There are a few different approaches to this case. One of them is to translate the problem into a traditional _multi-class classification task_, where the classes are in fact mutually exclusive. In order to do so, new classes are created, one corresponding to each of the combinations of outcomes found in the `train` set. After that, any model capable of handling classification with more than 2 classes can be applied to make predictions. Finally, the predictions are translated to the original set of outcomes by adding up, for each mechanism, the predictions for all the combinations in which it appears. This is the approach applied in the multi-class penalized mixture discriminant analysis (PMDA) model described below.
+
+A different approach is to treat the problem as a set of 206 independent classification tasks (one for each mechanism), where for each of them we attempt at distinguishing between the positive outcomes (the mechanism is in action) and negative outcomes (the mechanism is not in action). In either case, additional mechanisms may or may not also have positive outcomes. This is the One-vs-Rest (OvR) approach, and is the one taken for all models in this report except for the multi-class PMDA.
+
+When using the former approach, a possible adaptation is to implement a _classifier chain_, where each classifier uses the predictions made by the other ones as features. For example, predictions made for the `nfkb_inhibitor` could be used as features in the `proteasome_inhibitor` classifier. However, this approach does not lend itself well for the case at hand, where the vast majority of mechanisms are uncorrelated, and therefore offer very little "predictive power" to classifying the others.
+
+Another important insight gained through the exploratory data analysis is the fact that the dataset is highly imbalanced. Even the most frequently found mechanisms are only positive in around 3% of the samples. In a scenario like this, a classification algorithm would only indicate a positive outcome in cases with a very clear separation between positive and negative samples.
+
+While some techniques are available to deal with imbalanced datasets, like upsampling (taking bootstrap samples of the underrepresented class until proportions match) and SMOTE (downsampling the overrepresented class and creating synthetic samples for the underrepresented class until proportions match), they are not appropriate for the task at hand. Because the performance metric chosen for the competition is _log loss_, a misrepresentation of the prior probabilities for each class significantly hurts the performance. If the performance metric were not dependent on predicted class probabilities (as is the case with the _F-measure_) or if there were different penalties for misclassifying positive and negative outcomes (as is the case with the results from a medical exam), these techniques would be appropriate.
+
+An additional consequence of the choice of _log loss_ as a performance metric is that there is a severe penalty to overconfident incorrect predictions. In this setting, it is advantageous to impose a cap on the level of certainty with which the different models predict the outcome. Upon some experimentation, a lower limit of 10% of the mechanisms' prevalence and an upper limit of 99% certainty of a positive outcome seemed optimal.
+
+Another relevant point is the fact that most mechanisms do not show a clear separation between positive and negative outcomes, both in the original feature space and in the PCA-transformed space. This characteristic, combined with the high class imbalance discussed above, means that for most mechanisms the models will not be able to clearly identify positive outcomes. Rather than that, predictions will fluctuate around very low probabilities of a positive outcome.
+
+In this regard, the prediction task may seem a lot more like a regression on the conditional probability of a positive outcome than a proper binary classification.
+
+With all these insights in mind, a selection of different prediction models were trained to predict the probability of a positive outcome at each sample for each of the mechanisms. Then, an ensemble model was created using the predictions from the previous models as features to make a final prediction. 
+
+The following sections describe each of those models. Results are then discussed in details in the Results section.
+
+_**A note on optimizing performance through the choice of tuning parameters: even though some of these models have tuning parameters that can be finely tuned for optimal performance, the fact that we each of them is actually being used to fit 206 separate models makes is very time-consuming to do a grid search for optimal values. Thus, the parameters used here were chosen via a combination of experimentation and good judgment.**_
+
+### Benchmark
+
+We begin the modeling phase by constructing the benchmark model, against which the subsequent ones will be compared. For this model, we predict the probability of a positive outcome for each samples/mechanism combination as the prevalence for that mechanism, as measured in the `trainSingle` partition without the control samples. For the control vehicle samples (`cp_type == ctl_vehicle`), we set the prediction to zero.
+
+Upon measuring the performance of this prediction method on the `validate` partition, we get a _log loss_ of 0.0202 and a _root mean squared error_ (RMSE) of 0.0576.
+
+### Logistic Regression
+
+We then perform a logistic regression for each of the scored mechanisms, using the `train()` function from the `caret` package and the method `glm` with parameter `family = "binomial"`. Predictions for control samples are explicitly set to zero and the model is trained on the remaining samples in the `trainSingle` partition. Some experimentation shows that a combination of the `cp_time`, `cp_dose`, and the first 20 principal components provide the best results.
+
+Predictions are then made for the entire dataset and a lower and upper limit on predictions is imposed, as described above.
+
+The logistic regression model arrives at a _log loss_ of 0.0168 and _RMSE_ of 0.0530 in the `validate` partition.
+
+### K Nearest Neighbors
+
+A K nearest neighbors model is also fit to the data, using the `train()` function from the `caret` package and the `knn` method. Variables `cp_time`, `cp_dose` and the first 10 principal components are used as predictors. Predictions for control samples were explicitly set to zero, and a cap was imposed on the minimum and maximum levels of certainty.
+
+The number of neighbors is a tuning parameter that needs to be set in order to optimize performance. Because we are trying to predict a continuous value (probability of positive outcome) but the outcomes are actually binary, $K$ needs to be large enough so as to avoid predictions that are too "digitized". For example, a value of $K = 20$ would only permit predictions that are integer multiples of 5%. Since the mechanisms have prior probabilities in the range of 0-3%, this value of $K$ does not provide enough granularity to properly predict the probabilities.
+
+On the other hand, large values of $K$ make it so that each prediction averages the outcomes of samples that are not necessarily close to the one we are trying to predict. Additionally, predictions with a value of $K$ that is too big have an annoying tendency of crashing _R_ in the process.
+
+An appropriate compromise was found at a value of $K = 200$. Measurements in the `validate` partition show a _log loss_ of 0.0179 and _RMSE_ of 0.0527.
+
+### Naïve Bayes with loess smoothing
+
+A Naïve Bayes model was fit to the data, using a selection of principal components as predictors. With this approach, each predictor is assumed to be independent and has the effect on the outcome calculated separately.
+
+For each mechanism, each principal component was cut into numerous bins and the conditional probability of a positive outcome was calculated on each bin. Then, a _loess_ smoothing was applied to the conditional probability curve for each of the PCs with the `loess()` function. The predicted probability of a positive outcome was then calculated as the average of the predictions obtained separately from each of the principal components. Control samples had the predictions set to zero and were not used in tuning.
+
+Parameters were chosen globally and applied to every mechanism/PC combination. A selection of the first 3 principal components was used, each with its range divided into 15000 bins and smoothed with a 0.3 span.
+
+With these parameters, a _log loss_ of 0.0182 and _RMSE_ of 0.0557 was obtained in the `validate` partition.
+
+### Support Vector Machine
+
+A support vector machine (SVM) model was fit to the data using the `train()` function with method `svmLinear2`. This method permits tuning the model using the `cost` parameter. After fitting a model to each mechanism, the `predict()` function was used with parameter `type = "prob"` to get the predicted probability of a positive outcome.
+
+The SVM model makes predictions by finding the optimal separating hyperplane between the classes. It has a significant advantage for addressing classification problems in the fact that it is able to find separating hyperplanes that are oblique (as opposed to models like classification trees that only create new branches by splitting one variable at a time). This model can also make continuous estimates of the class probabilities according to each point's distance to the separating hyperplane.
+
+For each mechanism, an SVM model was created using the `cp_time` and `cp_dose` predictors and the first 50 principal components. The cost parameter was chosen for each mechanism through _leave-group-out cross-validation_, with 90% of the samples used for training.
+
+With these settings, a _log loss_ of 0.0161 and _RMSE_ of 0.0515 were obtained.
+
+### Multi-class Penalized Mixture Discriminant Analysis
+
+With some manipulation on the outcome variables, the _multi-label classification task_ was formulated as a _multi-class classification task_ and a penalized mixture discriminant analysis (PMDA) was fit to the data.
+
+First, the combinations of outcomes observed in the `trainSingle` partition were identified and given an unique id. As seen in the exploratory data analysis, these combinations can be made up of up to 11 different mechanisms. A total of 695 different combinations of scored and nonscored mechanisms has been identified, a sample of which is shown below:
+
+```{r combinations of outcomes}
+
+train$outcomes %>% 
+  left_join(train$outcomes_nonscored, by = "sig_id") %>% 
+  mutate(none = if_else(sig_id %in% partitions$noMechanism, 1, 0)) %>% 
+  filter(sig_id %in% partitions$trainSingle &
+           !(sig_id %in% partitions$controlSamples)) %>%
+  pivot_longer(cols = -"sig_id", names_to = "mechanism", values_to = "target") %>% 
+  filter(target == 1) %>% 
+  group_by(sig_id) %>% 
+  summarise(outcome = str_c(mechanism, collapse = " | "),
+            numMechanisms = sum(target),
+            .groups = 'drop') %>% 
+  group_by(outcome) %>% 
+  summarise(count = n(),
+            numMechanisms = first(numMechanisms),
+            .groups = 'drop') %>% 
+  arrange(desc(count)) %>% 
+  mutate(outcomeId = paste("id_", str_pad(row_number(),3,side = "left",pad = "0"), sep = "")) %>% 
+  sample_n(12) %>%
+  select(-numMechanisms) %>% 
+  kable(caption = "sample with different combinations of outcomes found in the trainSingle partition",
+        row.names = TRUE, col.names = c("outcome", "appearances", "id"))
+
+```
+
+In this formulation, the outcomes are in fact mutually exclusive, which means that any classification algorithm capable of dealing with more than 2 classes can be applied. Variations of the linear discriminant analysis (LDA) are particularly adequate for this scenario, as the feature distribution for each of the classes is calculated separately and the class probabilities are then calculated via Bayes' formula.
+
+In a mixture discriminant analysis model, the feature distribution for each class is calculated as a combination of distinct gaussian functions. The number of such functions can be chosen as a tuning parameter, and its centroids are determined during the fit process via a clustering algorithm. This adaptation is advantageous when the data is not normal, as is the case here.
+
+The "penalized" term indicates that a shrinkage procedure is automatically applied to the class centroids, which minimizes overfit and allows for more robust predictions.
+
+The PMDA model is fit using the `mda()` function from the `mda` package. The parameter `method = gen.ridge` tells the function to automatically apply the regularization. The number of subclasses is chosen as 2 after some experimentation, and the predictors are chosen as the first 10 principal components. After fitting the model, predictions are made for the entire dataset and multiplied by a conversion matrix that translates the predictions from the space of combinations of outcomes to the space of individual mechanisms.
+
+Upon measuring the performance of this model in the `validate` partition, a _log loss_ of 0.0175 and a _RMSE_ of 0.0543 are found.
+
+### Ensemble with weighted average
+
+As a final model for the probability of a positive outcome, we construct an ensemble of the previous models. A simplistic approach would be to predict the average between the other predictors, giving equal weight to all the models. However, we have seen that the _log loss_ performance of the different models are significantly different, so an ideal ensemble would give an increased weight to the best performing models.
+
+A linear regression model could be applied to the predictions, using the predicted probabilities from the previous models as features to a regression. However, the nature of the problem poses limitations to this approach. Because the features are highly correlated (evidently, since they are all attemps at predicting the same thing), a simple linear regression would lead to coefficients that are either very large positive or negative numbers. In this setup, there is a strong tendency to overfit the data, and to construct a model that is not robust.
+
+An alternative is to apply a linear regression with some sort of shrinkage of each model's coefficient towards unity, meaning that the fit would penalize a combination that strays too much from a simple average.
+
+Since penalized models normally provide shrinkage towards zero (instead of unity), we begin by calculating the simple average of the predictions from the previous models and then performing a linear regression on the residuals between the simple average and the ground truth. A model constructed like this does result in shrinkage towards the simple average, while allowing for adjustments to the weights of each of the predictors.
+
+To do so, we calculate the residuals and then use the `train()` function from the `caret` package with the `penalized` method, which permits tuning from a selection of L1 and L2 penalty parameters. We use the `trainEnsemble` partition to fit one model for each of the scored mechanisms, with 10-fold cross-validation to evaluate a grid of penalty parameters.
+
+After fitting the model and calculating predictions on the `validate` partition, we get a _log loss_ of 0.0158 and a _RMSE_ of 0.0513.
+
+***
+
+# Results
+
+In this section, we discuss the results obtained after applying the models constructed above to make probability predictions on the `validate` partition.
+
+First, we look at a selection of performance metrics for each of the individual models:
+
+```{r print model performance on validate set}
+
+predictions %>% 
+  filter(sig_id %in% partitions$validate) %>% 
+  pivot_longer(cols = -c("sig_id","mechanism","target"),
+               values_to = "prediction", names_to = "method") %>% 
+  group_by(method) %>% 
+  summarise(logLoss = logLoss(target,prediction),
+            RMSE = RMSE(target,prediction),
+            accuracy = mean(round(prediction,0) == target),
+            balancedAccuracy = .5*(1-mean(round(prediction[target == 0],0)) + 
+                                     .5*mean(round(prediction[target == 1],0))),
+            .groups = "drop") %>%
+  mutate(method = factor(method,
+                         levels = c("benchmark","logit","knn","naiveBayes","svmLinear",
+                                    "pmda","ensembleMean","ensembleWeighted"))) %>% 
+  arrange(method) %>% 
+  kable(caption = "model performance on validate partition",
+        row.names = TRUE, digits = 6)
+
+```
+
+As expected, the ensemble model with weighted means performs better than any of the other individual models both in terms of _log loss_ and _RMSE_. In fact, it outperforms the benchmark by around 21%.
+
+Both accuracy and balanced accuracy were calculated by rounding the probability of a positive outcome to the nearest integer. This amounts to assigning a positive outcome to a particular mechanism on a particular sample when the predicted probability of positive is greater than 50%. 
+
+Since the dataset is so highly imbalanced (there are many more negative outcomes than positive ones), the accuracy metric does not provide much valuable information. On the other hand, balanced accuracy (the average between the accuracy obtained in the negative cases and the positive cases) seems to be more informative.
+
+We note that the balanced accuracy metric is not much better than the benchmark for any of the models. At look at the confusion matrix and related metrics for the final model helps elucidate.
+
+```{r confusion matrix}
+
+predictions %>% 
+  mutate(prediction = ensembleWeighted) %>%
+  mutate(prediction = prediction %>% round(0) %>% as.factor(),
+         target = target %>% as.factor()) %>%
+  with(confusionMatrix(prediction, target, positive = "1"))
+  
+```
+The confusion matrix reveals a very low sensitivity, indicating that the model has a severe difficulty in identifying positive outcomes. In fact, there are many more cases of false negatives than there are true positives.
+
+Since the majority of the single models that made up the final ensemble model were themselves ensembles of models fit individually for each of the different _MoAs_, it is interesting to evaluate the performance separately for each of the mechanisms.
+
+The table below shows information on the mechanisms for which a sensitivity above 50% was reached. We see that it was only the case for 14 out of the 206 scored mechanisms. Not surprisingly, this list favors the ones with a significant correlation with at least of the predictors. One mechanism in particular - `proteasome_inhibitor` - has a sensitivity of 1, indicating that every single positive outcome has been correctly identified.
+
+```{r logLoss and sensitivity for each mechanism}
+
+meanLogLoss <-
+  predictions %>% 
+  filter(sig_id %in% partitions$validate) %>% 
+  select(mechanism, target, prediction = ensembleWeighted) %>% 
+  group_by(mechanism) %>% 
+  summarise(meanLogLoss = logLoss(target,prediction), .groups = "drop")
+
+correlations <-
+  cor(train$outcomes %>% select(-sig_id) %>% as.matrix,
+      train$features %>% select(starts_with("g-"), starts_with("c-")) %>% as.matrix) %>% 
+  as.data.frame() %>% 
+  rownames_to_column("mechanism") %>% 
+  pivot_longer(cols = -"mechanism", names_to = "predictor", values_to = "correlation") %>% 
+  group_by(mechanism) %>% 
+  summarise(predictor = predictor[which.max(abs(correlation))],
+            correlation = correlation[which.max(abs(correlation))],
+            .groups = "drop")
+
+predictions %>%
+  filter(sig_id %in% partitions$validate) %>% 
+  filter(target == 1) %>% 
+  mutate(prediction = ensembleWeighted %>% round(0)) %>%
+  group_by(mechanism) %>% 
+  summarise(sensitivity = mean(prediction),
+            .groups = "drop") %>% 
+  arrange(desc(sensitivity)) %>% 
+  left_join(meanLogLoss, by = "mechanism") %>% 
+  left_join(correlations, by = "mechanism") %>% 
+  filter(sensitivity >= .5) %>% 
+  kable(caption = "mechanisms with over 50% sensitivity measured in the validate partition",
+        row.names = TRUE, digits = 3)
+
+rm(meanLogLoss, correlations)
+  
+```
+
+We proceed to evaluate a plot of the _log loss_ performance obtained by each of the methods and for each of the mechanisms. In the figure below, individual mechanisms are in the horizontal axis, while the performance for each of the models is represented by points of different colors for each of the models.
+
+```{r predictions for each of the mechanisms}
+ll <-
+  predictions %>% 
+  filter(sig_id %in% partitions$validate) %>% 
+  group_by(mechanism) %>% 
+  summarise(logLossEnsembleMean = logLoss(target,ensembleMean), 
+            logLossEnsembleWeighted = logLoss(target,ensembleWeighted), 
+            .groups = "drop")
+  
+predictions %>% 
+  filter(sig_id %in% partitions$validate) %>% 
+  pivot_longer(cols = -c("sig_id","mechanism","target"), 
+               values_to = "prediction", names_to = "method") %>% 
+  mutate(method = factor(x = method,
+                         levels = c("benchmark","logit","knn","naiveBayes","svmLinear",
+                                    "pmda","ensembleMean","ensembleWeighted"))) %>% 
+  group_by(mechanism, method) %>% 
+  summarise(logLoss = logLoss(target,prediction), .groups = "drop") %>% 
+  left_join(mechanisms, by = "mechanism") %>% 
+  left_join(ll, by = "mechanism") %>% 
+  ggplot(aes(x = reorder(mechanism, logLossEnsembleWeighted), y = logLoss, color = method)) +
+  geom_point(data = . %>% filter(method %in% c("benchmark","logit","knn","naiveBayes","svmLinear","pmda")),
+             alpha = .8, size = 1) +
+  scale_y_continuous(trans = 'sqrt', breaks = seq(0,.15,.02)) +
+  geom_point(data = . %>% filter(method == "ensembleWeighted"), 
+             color = "black", size = .9) +
+  theme(axis.text.x = element_blank(), axis.ticks.x = element_blank(), 
+        panel.grid = element_blank(), legend.position = "none") +
+  labs(title = "Mean log loss for each mechanism",
+       x = "Mechanisms \n(ordered according to log loss of ensemble model)",
+       y = "Mean log loss")
+
+rm(ll)
+
+```
+_**FIGURE:** mean log loss measured separately for each mechanism. The colored dots represent each of the individual models, while the black dots represent the final weighted ensemble. The vertical axis is scaled with the square root._
+
+Because the mechanisms are ordered according to the performance obtained by the final model, there is a distinguishable line formed by the black dots corresponding to this model. Even though the ensemble model with the weighted averages does perform better than any of the single models, when looking at each mechanism individually the final model most times is not the one with the lowest score.
+
+We also note that the final model does not seem to be negatively affected by the outliers - cases where a particular models performs a lot worse than the others for a particular mechanism. This shows that the technique of applying a linear regression model to the residuals after averaging out the single models was effective in reducing the weight of these under-performing models.
+
+Also, these results do seem to provide a visual indication that there is a lower limit to the prediction capability of any model.
+
+We proceed to look at the _log loss_ obtained by the final model for each of the mechanisms, as a function of the prevalence of the mechanisms on the `trainSingle` partition:
+
+```{r performance versus prevalence}
+
+predictions %>% 
+  filter(sig_id %in% partitions$validate) %>% 
+  mutate(prediction = ensembleMean) %>% 
+  group_by(mechanism) %>% 
+  summarise(logLoss = logLoss(target,prediction), .groups = "drop") %>% 
+  left_join(mechanisms, by = "mechanism") %>% 
+  ggplot(aes(x = prevalence, y = logLoss)) +
+  geom_point(alpha = .8, size = 1.5, color = "blue") +
+  geom_smooth(method = "lm", se = FALSE, color = "red", linetype = "dashed") +
+  geom_label(data = . %>% filter(mechanism %in% c("nfkb_inhibitor","proteasome_inhibitor")), 
+             mapping = aes(label = mechanism),
+             size = 3, nudge_y = -.005, nudge_x = -.002) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(title = "Mean log loss for each mechanism as a function of prevalence",
+       x = "Prevalence \n(measured in the trainSingle partition)",
+       y = "Mean log loss \n(measured in the validate partition)")
+
+```
+_**FIGURE:** mean log loss for each mechanism measured in the validate partition. There is a clear positive correlation between the log loss and each mechanism's prevalence in the trainSingle partition, as illustrated by the red dashed linear regression line. Two clear outliers are identified, corresponding to the nfkb_inhibitor and proteasome_inhibitor mechanisms, both of which had a high correlation with at least one of the predictors and thus had particularly low losses._
+
+This scatter plot shows a positive correlation between the loss metric and each mechanism's prevalence. This can be explained by the fact that, with a higher prevalence, predicted probabilities of a positive outcome are typically not as low, so the cases with a negative outcome suffer a larger performance penalty.
+
+Another relevant indication of the performance of a probability prediction model is whether the model is balanced: that is, whether a prediction with a certain confidence does prove to be correct with a frequency matching that confidence.
+
+To evaluate this feature, we begin by dividing the predictions into bins and evaluating the amount of predictions that fell into each bin. Because there is a tendency for concentration into predictions that are either close to 0% or 100%, we create a larger number of bins around these points. The table below shows the resulting quantities and mean _log loss_ for each bin:
+```{r prediction density}
+
+predictions %>% 
+  filter(sig_id %in% partitions$validate) %>% 
+  mutate(prediction = ensembleWeighted,
+         prediction_bin = cut(x = ensembleWeighted, 
+                              breaks = c(seq(0,.1,.01), seq(.2,1,.1)), 
+                              include.lowest = TRUE)) %>% 
+  group_by(prediction_bin) %>% 
+  summarise(count = n(),
+            meanLogLoss = logLoss(target,prediction),
+            .groups = "drop") %>% 
+  kable(caption = "binned number of predictions in validate partition",
+        row.names = TRUE, col.names = c("range of predictions", "quantity", "mean log loss"))
+
+```
+
+The table confirms the intuition that most of the predicted probabilities are in the low numbers. In fact, the vast majority of them are under 1% chance of positive outcome. Because of the significant class imbalance, we see that there are a lot less positive predictions (probabilities over 50%), but these do have a tendency to concentrate on the 90-100% range.
+
+We also note that the mean _log loss_ is severely penalized outside the 0-1% prediction range. This is also a direct consequence of the class imbalance, confirming that under these conditions a low probability prediction is a "safer bet".
+
+To evaluate whether the prediction model is balanced, we calculate the rate of actual positive outcomes inside each of the bins and plot them against the average prediction inside each bin. The figure below depicts this information:
+
+```{r test if predictions are balanced}
+
+predictions %>%
+  filter(sig_id %in% partitions$validate) %>%
+  mutate(prediction = ensembleWeighted) %>%
+  mutate(prediction_bin = cut(prediction,
+                              breaks = seq(0,1,.05),
+                              include.lowest = TRUE)) %>%
+  group_by(prediction_bin) %>%
+  summarise(prediction = mean(prediction),
+            probability = mean(target), .groups = "drop") %>%
+  ggplot(aes(x = prediction, y = probability)) +
+  geom_line(color = "blue", size = 1) +
+  geom_abline(slope = 1, intercept = 0, color = 'red', linetype = 'dashed') +
+  scale_x_continuous(breaks = seq(0,1,.1), labels = scales::percent) +
+  scale_y_continuous(breaks = seq(0,1,.1), labels = scales::percent) +
+  coord_cartesian(xlim = c(0,1), ylim = c(0,1)) +
+  labs(title = "Predicted vs actual probabilities of positive outcome (0-100% range)",
+       x = "Predicted probability", y = "Actual probability")
+
+```
+_**FIGURE:** predicted probability vs actual probability of a positive outcome, measured in the validate partition. The blue line indicates the relationship between the two probabilities. The red dashed line is the identity line and serves as a reference of the expectation of a balanced prediction._
+
+The figure shows that the predicted probability do somewhat follow the identity line, albeit with some oscillation. Notably, there is a significant difference close to the line of 40% predicted probability.
+
+However, since the majority of predictions are concentrated in the lower range, the 0-5% range of predictions has a lot more weight on the final performance metric. Therefore, having a balanced prediction model in this range is much more important to the final results.
+
+In order to evaluate this aspect in more details, we look at a plot with the same information, but focussed on the 0-5% range, where the prior for all mechanisms lie:
+
+```{r are predictions balanced in 0 to 5 percent range}
+
+predictions %>%
+  filter(sig_id %in% partitions$validate) %>%
+  mutate(prediction = ensembleWeighted) %>%
+  mutate(prediction_bin = cut(prediction,
+                              breaks = c(seq(0,.1,.005), seq(.15,.85,.05), seq(.9,1,.01)),
+                              include.lowest = TRUE)) %>%
+  group_by(prediction_bin) %>%
+  summarise(prediction = mean(prediction),
+            probability = mean(target), .groups = "drop") %>%
+  filter(prediction <= .05) %>%
+  ggplot(aes(x = prediction, y = probability)) +
+  geom_line(color = "blue", size = 1) +
+  geom_abline(slope = 1, intercept = 0, color = 'red', linetype = 'dashed') +
+  scale_x_continuous(breaks = seq(0,.05,.01), labels = scales::percent) +
+  scale_y_continuous(breaks = seq(0,.08,.01), labels = scales::percent) +
+  coord_cartesian(xlim = c(0,.05), ylim = c(0,.08)) +
+  labs(title = "Predicted vs actual probabilities of positive outcome (0-5% range)",
+       x = "Predicted probability", y = "Actual probability")
+
+```
+_**FIGURE:** predicted probability vs actual probability of a positive outcome, measured in the validate partition, zoomed to interval from 0 to 5%._
+
+We see that, up to around 3%, the predictions tend to be reasonably balanced. Since the plot was created only with samples from the `validate` partition, this phenomenom is not due to overfitting.
+
+Finally, we look at a table with the results for the mechanisms where the best performance has been achieved with the final model:
+
+```{r log loss for best performing mechanisms}
+
+predictions %>% 
+  filter(sig_id %in% partitions$validate) %>% 
+  group_by(mechanism) %>% 
+  summarise(logLoss = logLoss(target,ensembleWeighted),
+            numPositives = sum(target),
+            sensitivity = sum(target == 1 & ensembleWeighted >= .5) / sum(target == 1),
+            .groups = "drop") %>% 
+  filter(numPositives > 10) %>% 
+  select(mechanism, logLoss, sensitivity, numPositives) %>% 
+  arrange(logLoss) %>% 
+  head(15) %>% 
+  kable(caption = "15 mechanisms with lowest log loss from final model (only mechanisms with more than 10 positives)",
+        row.names = TRUE, digits = 4)
+
+```
+
+We see that, for some mechanisms, the final model obtained a reasonably high sensitivity and low _log loss_. However, some of them have a low loss metric only at the cost of a null sensitivity and low number of positive occurrences in the `validate` partition.
+
+***
+
+# Conclusion
+
+In this project, we constructed a model that uses cell viability and gene expression data to estimate the probability that a particular mechanism of action is active when a drug is applied in a certain dosage and exposure time to a cell sample. The model was constructed as an ensemble of several individual models, calculated as a weighted average with different weights for each mechanism. 
+
+These individual models were fit using the `trainSingle` partition of the training set, with the ensemble tuned using the `trainEnsemble` partition. Results were evaluated in the `validate` partition and additional predictions were made in the `test` partition, for which the correct results were not provided.
+
+This problem has been posed as machine learning competition at the _kaggle.com_ website. 
+
+Results showed a significant improvement over the benchmark model, with the _log loss_ performance metric being reduced from 0.0202 to 0.0158, a 21% reduction.
+
+Among the single models, 5 of them treated the problem as 206 individual prediction _multi-label classification tasks_ (one for each mechanism, in an One-vs-Rest approach), while 1 treated it as a _multi-class classification task_, with tasks made up of combinations of individual mechanisms. The final model also addressed the task individually for each mechanism.
+
+Results fluctuated a lot among different mechanisms, especially when looking at the sensitivity metric (ratio of correct classifications on actual positive outcomes). For many of the mechanisms, the models were grossly unable to identify positive outcomes, reaching very low (sometimes even null) sensitivity levels. 
+
+These results seem to indicate that the selection of predictors have very low predictive power over many of the mechanisms, holding very little information about whether or not these mechanisms are in effect. The application of the same methodology to a different set of genes might arrive at much better results.
+
+However, for some other mechanisms, very high sensitivity levels and low _log loss_ were achieved, meaning that the model does have the potential to be used in practice.
+
+Because this project is being presented as part of the capstone project for the Data Science Professional Certificate program, the models were selected in an attempt to use techniques that were either addressed in the courses or are somewhat related to these techniques. In an extension to this work, other methods could be experimented with, such as boosting and neural networks.
+
+Nevertheless, it is worth noting that a choice of more sophisticated models does not necessarily ensure better performance. In the selection presented in this report, the simple logistic regression presented a lower loss than KNN, naïve Bayes and PMDA.
+
+The choice of the cross-validation setup has been influenced by the fact that some sort of performance reporting is necessary for the project. The decision to set aside the `validation` partition of the training data permits calculating the performance on a set of samples with known outcomes, but effectively reduces the size of the training set and degrades the performance measured in the `test` set. However, this choice does allow for the evaluation of results in a setting with no risk of overfitting.
+
+Ideally, after deciding on a modeling technique using this cross-validation approach, a final model would be fit to the entire `train` set and used to make preditions in the `test` set.
+
+It is also worth noting that the term "prevalence" has been used in a loose sense during this project. It refers to the frequency with which each mechanism had a positive outcome, as measured in the `trainSingle` partition. However, there is no direct connection to a mechanism's proportion in a population, as the term suggests. In fact, it does not even make much sense to think of a population in this context, since the observations corresponded to samples (in the biological, not statistical sense) taken from a larger collection. The use of the "prevalence" term during modeling, be it explicitly or in the underlying assumption each of the models count on, assumes that the `train` set is statistically representative of the `test` set, which may not be the case.
+
+As a final comment on the project, the challenges involved in this prediction task turned out to be very different to what one might have expected. Surprisingly, the reduction of the loss metric did not depend heavily on discerning whether a particular mechanism should be classified as a positive or negative for a particular sample. It did depend much more heavily on accurately identifying the very low probability of a positive outcome, which typically lied in the 0-5% range. As such, the problem bears a much closer resemblance to a _regression_ on the level of certainty with which it can be stated that the outcome is negative than to a _classification_ where positive and negative outcomes are separated from one another.

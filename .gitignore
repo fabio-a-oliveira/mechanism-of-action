@@ -27,6 +27,7 @@ vignettes/*.pdf
 *.knit.md
 # R Environment Variables
 .Renviron
+<<<<<<< HEAD
 # csv files
 sample_submission.csv
 test_features.csv
@@ -34,3 +35,11 @@ train_features.csv
 train_targets_nonscored.csv
 train_targets_scored.csv
 old (dell).rar
+=======
+old (asus).rar
+lish-moa.zip
+images
+HX9_CYO_Report_files
+HX9_CYO_Main.RData
+HX9_CYO_Report.html
+>>>>>>> eec87eb0d9b41526cf3d3e5e3ec47d9488e60a77
